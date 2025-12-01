@@ -10,7 +10,10 @@ const db = new sqlite3.Database(dbPath);
 // Map: webviewuuid -> { uuid -> { display: ws, senders: Set<ws> } }
 const canvasSockets = new Map();
 
-const wss = new WebSocket.Server({ port: 3001 });
+const wss = new WebSocket.Server({
+    port: 3001,
+    perMessageDeflate: false
+});
 
 wss.on('connection', (ws) => {
     ws.displayRegistrations = new Set();
@@ -93,7 +96,7 @@ wss.on('connection', (ws) => {
                     uuids: uuidsForDisplay
                 };
                 const frameBuffer = encodeBinaryFrame(header, typedPixels);
-                displayWs.send(frameBuffer, { binary: true });
+                displayWs.send(frameBuffer, { binary: true, compress: false });
                 console.log(`[${webviewuuid}] Pixel data sent to display client for ${uuidsForDisplay.length} canvas(es) (${typedPixels.length} bytes${region ? ', region' : ', full frame'})`);
             });
         } catch (e) {
