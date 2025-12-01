@@ -2,5 +2,9 @@
   "scripts": {
     "build": "npm ci",
     "serve": "node index.js"
+  },
+  "dependencies": {
+    "sqlite3": "^5.1.7",
+    "uuid": "^13.0.0"
   }
 }

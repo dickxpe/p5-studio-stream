@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>p5 Canvases Grid</title>
+  <script src="/p5/p5.min.js"></script>
+  <script id="p5-test-script" type="text/plain" src="/p5/test.js"></script>
+  <style>
+    body { margin: 0; padding: 0; overflow: hidden; }
+    #canvases {
+      position: absolute;
+      left: 0;
+      top: 0;
+      transform-origin: top left;
+      margin: 0;
+      padding: 0;
+      font-size: 0;
+      line-height: 0;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0;
+    }
+    .p5canvas-outer {
+      width: 100%;
+      height: 100%;
+      position: relative;
+      overflow: visible;
+      display: block;
+    }
+    .canvas-label {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      font-family: monospace;
+      font-size: 14px;
+      color: #333;
+      background: rgba(110, 110, 110, 0.171);
+      pointer-events: none;
+      z-index: 10;
+      padding: 0;
+      border-radius: 6px;
+      box-sizing: border-box;
+      width: 100%;
+      max-width: 90%;
+      overflow: visible;
+      line-height: 1.7;
+      white-space: normal;
+      height: 90%;
+    }
+
+    .p5canvas {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      border: none;
+      font-size: 0;
+      line-height: 0;
+      position: relative;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .p5canvas canvas {
+      display: block;
+      margin: 0;
+      padding: 0;
+      border: none;
+      outline: none;
+      box-shadow: none;
+      background: none;
+      font-size: 0;
+      line-height: 0;
+      image-rendering: pixelated;
+      vertical-align: top;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="canvases"></div>
+  <script>
+    const canvasWidthPx = typeof window.gridWidth === 'number' ? window.gridWidth : 100;
+    const canvasHeightPx = typeof window.gridHeight === 'number' ? window.gridHeight : 100;
+    // Always use gridRows and gridCols if present (injected by server)
+    const cols = typeof window.gridCols === 'number' ? window.gridCols : 10;
+    const rows = typeof window.gridRows === 'number' ? window.gridRows : 10;
+    const canvasesDiv = document.getElementById('canvases');
+
+    // --- Responsive grid: create once, rescale on resize ---
+    let gridInitialized = false;
+    let gridContainers = [];
+    let gridCanvases = [];
+    let gridPlaceholders = [];
+    let gridRows = rows;
+    let gridCols = cols;
+    let uuids = [];
+
+    async function createGrid() {
+      // Fetch UUIDs for this webview
+      try {
+        const uuidResp = await fetch(`/uuids/${window.uuid}`);
+        if (uuidResp.ok) {
+          uuids = await uuidResp.json();
+        }
+      } catch (e) {}
+
+      let counter = 0;
+      for (let y = 0; y < gridRows; y++) {
+        for (let x = 0; x < gridCols; x++) {
+          // Outer container for label + canvas
+          const outer = document.createElement('div');
+          outer.className = 'p5canvas-outer';
+          canvasesDiv.appendChild(outer);
+          // Inner container for canvas only
+          const container = document.createElement('div');
+          container.className = 'p5canvas';
+          outer.appendChild(container);
+          gridContainers.push(container);
+          const assignedUUID = uuids[counter] || '';
+          const thisCounter = counter; // capture for closure
+          if (assignedUUID) {
+            // Create label div
+            const label = document.createElement('div');
+            label.className = 'canvas-label';
+            label.innerHTML = `<span class="canvas-label-counter">${thisCounter}</span><span class="canvas-label-ready">ready</span><span class="canvas-label-uuid">${assignedUUID}</span>`;
+            outer.insertBefore(label, container);
+            let p5inst = new p5((sk) => {
+              sk.setup = function() {
+                sk.pixelDensity(1);
+                sk.createCanvas(canvasWidthPx, canvasHeightPx).parent(container);
+                sk.background(255);
+                sk.width = canvasWidthPx;
+                sk.height = canvasHeightPx;
+
+                sk.uuid = sk.uuid || assignedUUID;
+                sk.webviewuuid = sk.webviewuuid || window.webviewuuid || window.uuid;
+
+                sk.ws = new window.WebSocket('ws://localhost:3001');
+                sk.ws.onopen = () => {
+                  sk.ws.send(JSON.stringify({
+                    webviewuuid: sk.webviewuuid,
+                    uuid: sk.uuid,
+                    pixels: []
+                  }));
+                };
+                sk.ws.onclose = (event) => {};
+                sk.ws.onerror = (event) => {};
+                sk.ws.onmessage = (event) => {
+                  let data = JSON.parse(event.data);
+                  if (data.uuid === sk.uuid && Array.isArray(data.pixels)) {
+                    label.style.display = 'none';
+                    sk.testDrawPixels(data.pixels);
+                  }
+                };
+              };
+              sk.testDrawPixels = function(pixelsArr) {
+                sk.loadPixels();
+                for (let i = 0; i < sk.pixels.length && i < pixelsArr.length; i++) {
+                  sk.pixels[i] = pixelsArr[i];
+                }
+                sk.updatePixels();
+              };
+              sk.uuid = assignedUUID;
+            }, container);
+            gridCanvases.push(container.querySelector('canvas'));
+          } else {
+            // Show a blank or placeholder canvas and overlay label 'available'
+            const placeholder = document.createElement('canvas');
+            placeholder.width = canvasWidthPx;
+            placeholder.height = canvasHeightPx;
+            placeholder.style.background = 'none';
+            placeholder.style.border = 'none';
+            placeholder.style.margin = '0';
+            placeholder.style.padding = '0';
+            placeholder.style.display = 'block';
+            container.appendChild(placeholder);
+            gridPlaceholders.push(placeholder);
+            // Add overlay label
+            const label = document.createElement('div');
+            label.className = 'canvas-label';
+            label.innerHTML = `<span class="canvas-label-counter">${thisCounter}</span><span class="canvas-label-ready">available</span><span class="canvas-label-uuid"> </span>`;
+            outer.insertBefore(label, container);
+          }
+          counter++;
+        }
+      }
+      gridInitialized = true;
+    }
+
+    function rescaleGrid() {
+      // --- Scaling code commented out as requested ---
+      /*
+      const baseW = typeof window.gridWidth === 'number' ? window.gridWidth : 100;
+      const baseH = typeof window.gridHeight === 'number' ? window.gridHeight : 100;
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      const gridW = gridCols * baseW;
+      const gridH = gridRows * baseH;
+      let scale = Math.min(w / gridW, h / gridH);
+      let useFractional = false;
+      console.log('[Grid] Current scale:', scale);
+      let warningDiv = document.getElementById('grid-warning');
+      if (scale >= 1) {
+        scale = Math.floor(scale); // Use largest integer scale for crisp rendering
+        if (warningDiv) warningDiv.style.display = 'none';
+      } else {
+        useFractional = true;
+        // Use fractional scale to fit grid, but show warning for 2 seconds
+        if (!warningDiv) {
+          warningDiv = document.createElement('div');
+          warningDiv.id = 'grid-warning';
+          warningDiv.style.position = 'fixed';
+          warningDiv.style.top = '0';
+          warningDiv.style.left = '0';
+          warningDiv.style.width = '100vw';
+          warningDiv.style.background = 'rgba(255,200,0,0.95)';
+          warningDiv.style.color = '#222';
+          warningDiv.style.fontFamily = 'monospace';
+          warningDiv.style.fontSize = '18px';
+          warningDiv.style.textAlign = 'center';
+          warningDiv.style.zIndex = '10000';
+          warningDiv.style.padding = '8px 0';
+          warningDiv.innerText = 'Window too small for crisp grid: scaling down.';
+          document.body.appendChild(warningDiv);
+        } else {
+          warningDiv.style.display = '';
+        }
+        // Hide warning after 2 seconds
+        setTimeout(() => {
+          if (warningDiv) warningDiv.style.display = 'none';
+        }, 2000);
+      }
+      // Always use integer CSS sizes for crisp rendering
+      const canvasWidth = Math.round(baseW * scale);
+      const canvasHeight = Math.round(baseH * scale);
+      if (!window._canvasDimsLogged) {
+        console.log('[Grid] Canvas dimensions:', canvasWidth, 'x', canvasHeight);
+        window._canvasDimsLogged = true;
+      }
+      canvasesDiv.style.width = (gridCols * canvasWidth) + 'px';
+      canvasesDiv.style.height = (gridRows * canvasHeight) + 'px';
+      canvasesDiv.style.setProperty('--cols', gridCols);
+      canvasesDiv.style.setProperty('--rows', gridRows);
+      // Rescale all containers and canvases
+      // Outer container gets scaled, inner canvas container and label are sized by flex
+      const outerContainers = document.querySelectorAll('.p5canvas-outer');
+      for (let i = 0; i < outerContainers.length; i++) {
+        if (outerContainers[i]) {
+          outerContainers[i].style.width = canvasWidth + 'px';
+          outerContainers[i].style.height = canvasHeight + 'px';
+        }
+      }
+      for (let i = 0; i < gridContainers.length; i++) {
+        if (gridContainers[i]) {
+          gridContainers[i].style.width = '100%';
+          gridContainers[i].style.height = '100%';
+        }
+      }
+      for (let i = 0; i < gridCanvases.length; i++) {
+        if (gridCanvases[i]) {
+          gridCanvases[i].style.width = canvasWidth + 'px';
+          gridCanvases[i].style.height = canvasHeight + 'px';
+        }
+      }
+      for (let i = 0; i < gridPlaceholders.length; i++) {
+        if (gridPlaceholders[i]) {
+          gridPlaceholders[i].style.width = canvasWidth + 'px';
+          gridPlaceholders[i].style.height = canvasHeight + 'px';
+        }
+      }
+      */
+      // Set grid and canvas sizes to database-provided base size
+      const totalWidth = gridCols * canvasWidthPx;
+      const totalHeight = gridRows * canvasHeightPx;
+      canvasesDiv.style.width = totalWidth + 'px';
+      canvasesDiv.style.height = totalHeight + 'px';
+      canvasesDiv.style.setProperty('--cols', gridCols);
+      canvasesDiv.style.setProperty('--rows', gridRows);
+      const viewportW = window.innerWidth;
+      const viewportH = window.innerHeight;
+      const scale = Math.min(1, Math.min(viewportW / totalWidth, viewportH / totalHeight));
+      const offsetX = (viewportW - totalWidth * scale) / 2;
+      const offsetY = (viewportH - totalHeight * scale) / 2;
+      canvasesDiv.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+      const outerContainers = document.querySelectorAll('.p5canvas-outer');
+      for (let i = 0; i < outerContainers.length; i++) {
+        if (outerContainers[i]) {
+          outerContainers[i].style.width = canvasWidthPx + 'px';
+          outerContainers[i].style.height = canvasHeightPx + 'px';
+        }
+      }
+      for (let i = 0; i < gridContainers.length; i++) {
+        if (gridContainers[i]) {
+          gridContainers[i].style.width = '100%';
+          gridContainers[i].style.height = '100%';
+        }
+      }
+      for (let i = 0; i < gridCanvases.length; i++) {
+        if (gridCanvases[i]) {
+          gridCanvases[i].style.width = canvasWidthPx + 'px';
+          gridCanvases[i].style.height = canvasHeightPx + 'px';
+        }
+      }
+      for (let i = 0; i < gridPlaceholders.length; i++) {
+        if (gridPlaceholders[i]) {
+          gridPlaceholders[i].style.width = canvasWidthPx + 'px';
+          gridPlaceholders[i].style.height = canvasHeightPx + 'px';
+        }
+      }
+    }
+
+    async function renderGrid() {
+      if (!gridInitialized) {
+        await createGrid();
+      }
+      rescaleGrid();
+    }
+
+    // Initial render
+    renderGrid();
+    // Only rescale on resize
+    window.addEventListener('resize', rescaleGrid);
+  </script>
+</body>
+</html>

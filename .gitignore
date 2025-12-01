@@ -1,0 +1,16 @@
+node_modules/
+.env
+*.sqlite
+*.db
+.DS_Store
+*.log
+npm-debug.log
+dist/
+build/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.bak
+.idea/
+*.ps1
