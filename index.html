@@ -143,6 +143,10 @@
                 sk.uuid = sk.uuid || assignedUUID;
                 sk.webviewuuid = sk.webviewuuid || window.webviewuuid || window.uuid;
 
+                sk.frameQueue = [];
+                sk.processingFrame = false;
+                sk.lastFrameTime = 0;
+
                 sk.ws = new window.WebSocket('ws://localhost:3001');
                 sk.ws.onopen = () => {
                   sk.ws.send(JSON.stringify({
@@ -157,16 +161,86 @@
                   let data = JSON.parse(event.data);
                   if (data.uuid === sk.uuid && Array.isArray(data.pixels)) {
                     label.style.display = 'none';
-                    sk.testDrawPixels(data.pixels);
+                    sk.enqueuePixelPayload(data);
                   }
                 };
               };
-              sk.testDrawPixels = function(pixelsArr) {
-                sk.loadPixels();
-                for (let i = 0; i < sk.pixels.length && i < pixelsArr.length; i++) {
-                  sk.pixels[i] = pixelsArr[i];
+              sk.enqueuePixelPayload = function(payload) {
+                sk.frameQueue.push(payload);
+                if (!sk.processingFrame) {
+                  sk.processingFrame = true;
+                  sk.flushFrameQueue();
                 }
-                sk.updatePixels();
+              };
+              sk.flushFrameQueue = function() {
+                if (sk.frameQueue.length === 0) {
+                  sk.processingFrame = false;
+                  return;
+                }
+                const nextFrame = sk.frameQueue.shift();
+                sk.applyPixelPayload(nextFrame);
+                window.requestAnimationFrame(() => {
+                  sk.flushFrameQueue();
+                });
+              };
+              sk.applyPixelPayload = function(payload) {
+                if (!payload || !Array.isArray(payload.pixels)) {
+                  return;
+                }
+                const targetWidth = sk.width;
+                const targetHeight = sk.height;
+                const typedPixels = payload.pixels instanceof Uint8ClampedArray
+                  ? payload.pixels
+                  : Uint8ClampedArray.from(payload.pixels);
+                if (payload.region && !payload.isFullFrame) {
+                  const region = payload.region || {};
+                  const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
+                  const regionHeight = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
+                  if (!regionWidth || !regionHeight) {
+                    return;
+                  }
+                  const expected = regionWidth * regionHeight * 4;
+                  if (typedPixels.length < expected) {
+                    return;
+                  }
+                  let destX = Number.isFinite(region.x) ? Math.floor(region.x) : 0;
+                  let destY = Number.isFinite(region.y) ? Math.floor(region.y) : 0;
+                  if (destX >= targetWidth || destY >= targetHeight) {
+                    return;
+                  }
+                  if (destX < 0) destX = 0;
+                  if (destY < 0) destY = 0;
+                  try {
+                    const imageData = new ImageData(typedPixels, regionWidth, regionHeight);
+                    sk.drawingContext.putImageData(imageData, destX, destY);
+                  } catch (err) {
+                    console.warn('[Display] Failed to draw region payload', err);
+                  }
+                  return;
+                }
+                const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
+                const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
+                const expectedFull = fullWidth * fullHeight * 4;
+                if (typedPixels.length !== expectedFull) {
+                  sk.loadPixels();
+                  const max = Math.min(sk.pixels.length, typedPixels.length);
+                  for (let i = 0; i < max; i++) {
+                    sk.pixels[i] = typedPixels[i];
+                  }
+                  sk.updatePixels();
+                  return;
+                }
+                try {
+                  const imageData = new ImageData(typedPixels, fullWidth, fullHeight);
+                  sk.drawingContext.putImageData(imageData, 0, 0);
+                } catch (err) {
+                  sk.loadPixels();
+                  const max = Math.min(sk.pixels.length, typedPixels.length);
+                  for (let i = 0; i < max; i++) {
+                    sk.pixels[i] = typedPixels[i];
+                  }
+                  sk.updatePixels();
+                }
               };
               sk.uuid = assignedUUID;
             }, container);

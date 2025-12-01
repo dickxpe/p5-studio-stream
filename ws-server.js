@@ -52,10 +52,20 @@ wss.on('connection', (ws) => {
                 }
                 // If this is a sender, forward to display
                 if (!isDisplay) {
-                    const displayWs = uuidMap.get(uuid).display;
+                    const entry = uuidMap.get(uuid);
+                    const displayWs = entry && entry.display;
                     if (displayWs && displayWs.readyState === WebSocket.OPEN) {
-                        displayWs.send(JSON.stringify({ uuid, pixels: data.pixels }));
-                        console.log(`[${webviewuuid}/${uuid}] Pixel data sent to display client (${data.pixels.length} values)`);
+                        const region = sanitizeRegion(data.region);
+                        const payload = {
+                            uuid,
+                            pixels: data.pixels,
+                            region,
+                            isFullFrame: !!data.isFullFrame,
+                            fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : undefined,
+                            fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined
+                        };
+                        displayWs.send(JSON.stringify(payload));
+                        console.log(`[${webviewuuid}/${uuid}] Pixel data sent to display client (${data.pixels.length} values${region ? ', region' : ', full frame'})`);
                     } else {
                         console.log(`[${webviewuuid}/${uuid}] No display client to send pixel data`);
                     }
@@ -89,3 +99,13 @@ wss.on('connection', (ws) => {
 });
 
 console.log('WebSocket server running on ws://localhost:3001');
+
+function sanitizeRegion(region) {
+    if (!region || typeof region !== 'object') return null;
+    const x = Number.isFinite(region.x) ? Math.max(0, region.x) : 0;
+    const y = Number.isFinite(region.y) ? Math.max(0, region.y) : 0;
+    const width = Number.isFinite(region.width) ? Math.max(1, region.width) : null;
+    const height = Number.isFinite(region.height) ? Math.max(1, region.height) : null;
+    if (!width || !height) return null;
+    return { x, y, width, height };
+}
