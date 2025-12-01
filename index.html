@@ -268,6 +268,7 @@
       constructor() {
         this.entries = new Map();
         this.rafId = null;
+        this.maxQueueSize = 6;
       }
 
       registerCanvas(uuid, canvasElement, labelElement) {
@@ -292,6 +293,7 @@
           entry.label.style.display = 'none';
           entry.label = null;
         }
+        this.applyBackpressure(entry, payload);
         entry.queue.push(payload);
         if (!this.rafId) {
           this.rafId = window.requestAnimationFrame(() => this.flush());
@@ -402,6 +404,39 @@
           imageData.data.set(pixelArray);
           return imageData;
         }
+      }
+
+      applyBackpressure(entry, newestPayload) {
+        const newestKey = this.buildQueueKey(newestPayload);
+        if (newestKey) {
+          for (let i = entry.queue.length - 1; i >= 0; i--) {
+            if (this.buildQueueKey(entry.queue[i]) === newestKey) {
+              entry.queue.splice(i, 1);
+              break;
+            }
+          }
+        }
+        while (entry.queue.length >= this.maxQueueSize) {
+          entry.queue.shift();
+        }
+      }
+
+      buildQueueKey(payload) {
+        if (!payload) {
+          return null;
+        }
+        if (payload.isFullFrame || !payload.region) {
+          return 'full';
+        }
+        const region = payload.region;
+        const x = Number.isFinite(region.x) ? Math.floor(region.x) : 0;
+        const y = Number.isFinite(region.y) ? Math.floor(region.y) : 0;
+        const w = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
+        const h = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
+        if (!w || !h) {
+          return null;
+        }
+        return `r:${x},${y},${w},${h}`;
       }
     }
 
