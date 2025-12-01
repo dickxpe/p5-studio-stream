@@ -136,7 +136,6 @@ this.testSetup = function () {
         const targetWidth = sk.width;
         const targetHeight = sk.height;
         if (typedPixels.length !== targetWidth * targetHeight * 4) {
-            // Fallback: draw as region covering the payload dimensions if provided
             const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
             const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
             drawRegion({ x: 0, y: 0, width: fullWidth, height: fullHeight });

@@ -165,6 +165,7 @@ function sendPayloadToAll(pixelsArray, region, isFullFrame) {
     const basePayload = {
         webviewuuid: TARGET_WEBVIEWUUID,
         senderId,
+        uuids: targetUUIDs.slice(),
         pixels: serializedPixels,
         isFullFrame,
         fullWidth: width,
@@ -173,10 +174,7 @@ function sendPayloadToAll(pixelsArray, region, isFullFrame) {
     if (region) {
         basePayload.region = region;
     }
-    targetUUIDs.forEach((uuid) => {
-        const payload = { ...basePayload, uuid };
-        ws.send(JSON.stringify(payload));
-    });
+    ws.send(JSON.stringify(basePayload));
 }
 
 function extractDirtyTiles(current, previous, canvasWidth, canvasHeight) {

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>p5 Canvases Grid</title>
   <script src="/p5/p5.min.js"></script>
-  <script id="p5-test-script" type="text/plain" src="/p5/test.js"></script>
+  <script id="p5-test-script" type="text/plain" src="/p5/display-client.js"></script>
   <style>
     body { margin: 0; padding: 0; overflow: auto; background: #fff; }
     #canvases {
@@ -122,13 +122,9 @@
           return;
         }
         this.ws.onopen = () => {
-          this.handlers.forEach((_, uuid) => {
-            this.sendRegistration(uuid);
-          });
+          this.handlers.forEach((_, uuid) => this.sendRegistration(uuid));
         };
-        this.ws.onmessage = (event) => {
-          this.handleMessage(event);
-        };
+        this.ws.onmessage = (event) => this.handleMessage(event);
         this.ws.onerror = (event) => {
           console.warn('[DisplaySocket] WebSocket error', event);
         };
@@ -139,11 +135,11 @@
       }
 
       scheduleReconnect() {
-        if (this.reconnectTimer) return;
-        this.reconnectTimer = window.setTimeout(() => {
-          this.reconnectTimer = null;
-          this.connect();
-        }, this.reconnectDelay);
+          if (this.reconnectTimer) return;
+          this.reconnectTimer = window.setTimeout(() => {
+            this.reconnectTimer = null;
+            this.connect();
+          }, this.reconnectDelay);
       }
 
       isOpen() {
@@ -173,7 +169,7 @@
             const parsed = JSON.parse(event.data);
             this.dispatchPayload(parsed);
           } catch (err) {
-            console.warn('[DisplaySocket] Failed to parse text message', err);
+            console.warn('[DisplaySocket] Failed to parse message', err);
           }
           return;
         }
@@ -197,7 +193,27 @@
       }
 
       dispatchPayload(data) {
-        if (!data || typeof data.uuid === 'undefined') {
+        if (!data) {
+          return;
+        }
+        if (Array.isArray(data.uuids) && data.uuids.length) {
+          data.uuids.forEach((targetUuid) => {
+            const handler = this.handlers.get(targetUuid);
+            if (handler) {
+              handler({
+                uuid: targetUuid,
+                pixels: data.pixels,
+                region: data.region,
+                isFullFrame: data.isFullFrame,
+                fullWidth: data.fullWidth,
+                fullHeight: data.fullHeight,
+                pixelLength: data.pixelLength
+              });
+            }
+          });
+          return;
+        }
+        if (typeof data.uuid === 'undefined') {
           return;
         }
         const handler = this.handlers.get(data.uuid);
@@ -236,6 +252,148 @@
       }
     }
 
+    class CanvasRenderManager {
+      constructor() {
+        this.entries = new Map();
+        this.rafId = null;
+      }
+
+      registerCanvas(uuid, canvasElement, labelElement) {
+        const ctx = canvasElement.getContext('2d');
+        if (ctx) {
+          ctx.imageSmoothingEnabled = false;
+        }
+        this.entries.set(uuid, {
+          canvas: canvasElement,
+          ctx,
+          label: labelElement,
+          queue: []
+        });
+      }
+
+      enqueue(uuid, payload) {
+        const entry = this.entries.get(uuid);
+        if (!entry || !payload) {
+          return;
+        }
+        if (entry.label) {
+          entry.label.style.display = 'none';
+          entry.label = null;
+        }
+        entry.queue.push(payload);
+        if (!this.rafId) {
+          this.rafId = window.requestAnimationFrame(() => this.flush());
+        }
+      }
+
+      flush() {
+        this.rafId = null;
+        let hasRemaining = false;
+        this.entries.forEach((entry) => {
+          if (!entry.queue.length) {
+            return;
+          }
+          hasRemaining = true;
+          while (entry.queue.length) {
+            const payload = entry.queue.shift();
+            this.applyPayload(entry, payload);
+          }
+        });
+        if (hasRemaining) {
+          this.rafId = window.requestAnimationFrame(() => this.flush());
+        }
+      }
+
+      applyPayload(entry, payload) {
+        const ctx = entry.ctx;
+        if (!ctx) {
+          return;
+        }
+        const rawPixels = payload && payload.pixels;
+        if (!rawPixels) {
+          return;
+        }
+        const typedPixels = rawPixels instanceof Uint8ClampedArray
+          ? rawPixels
+          : new Uint8ClampedArray(rawPixels);
+
+        if (payload.region && !payload.isFullFrame) {
+          this.drawRegion(entry, typedPixels, payload.region);
+          return;
+        }
+
+        const targetWidth = entry.canvas.width;
+        const targetHeight = entry.canvas.height;
+        if (typedPixels.length === targetWidth * targetHeight * 4) {
+          const imageData = this.createImageData(ctx, typedPixels, targetWidth, targetHeight);
+          ctx.putImageData(imageData, 0, 0);
+          return;
+        }
+        const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
+        const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
+        this.drawRegion(entry, typedPixels, { x: 0, y: 0, width: fullWidth, height: fullHeight });
+      }
+
+      drawRegion(entry, typedPixels, region) {
+        const ctx = entry.ctx;
+        if (!ctx) {
+          return;
+        }
+        const targetWidth = entry.canvas.width;
+        const targetHeight = entry.canvas.height;
+        const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
+        const regionHeight = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
+        if (!regionWidth || !regionHeight) {
+          return;
+        }
+        const expected = regionWidth * regionHeight * 4;
+        if (typedPixels.length !== expected) {
+          console.warn('[Display] Region payload length mismatch', expected, typedPixels.length);
+          return;
+        }
+        let destX = Number.isFinite(region.x) ? Math.floor(region.x) : 0;
+        let destY = Number.isFinite(region.y) ? Math.floor(region.y) : 0;
+        let srcOffsetX = 0;
+        let srcOffsetY = 0;
+        if (destX < 0) {
+          srcOffsetX = Math.min(regionWidth, -destX);
+          destX = 0;
+        }
+        if (destY < 0) {
+          srcOffsetY = Math.min(regionHeight, -destY);
+          destY = 0;
+        }
+        const copyWidth = Math.min(regionWidth - srcOffsetX, targetWidth - destX);
+        const copyHeight = Math.min(regionHeight - srcOffsetY, targetHeight - destY);
+        if (copyWidth <= 0 || copyHeight <= 0) {
+          return;
+        }
+        let payload = typedPixels;
+        if (srcOffsetX !== 0 || srcOffsetY !== 0 || copyWidth !== regionWidth || copyHeight !== regionHeight) {
+          payload = new Uint8ClampedArray(copyWidth * copyHeight * 4);
+          const srcStride = regionWidth * 4;
+          for (let row = 0; row < copyHeight; row++) {
+            const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
+            const destIndex = row * copyWidth * 4;
+            payload.set(typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4), destIndex);
+          }
+        }
+        const imageData = this.createImageData(ctx, payload, copyWidth, copyHeight);
+        ctx.putImageData(imageData, destX, destY);
+      }
+
+      createImageData(ctx, pixelArray, width, height) {
+        try {
+          return new ImageData(pixelArray, width, height);
+        } catch (err) {
+          const imageData = ctx.createImageData(width, height);
+          imageData.data.set(pixelArray);
+          return imageData;
+        }
+      }
+    }
+
+    const canvasRenderer = new CanvasRenderManager();
     const sharedDisplaySocket = window._sharedDisplaySocket || new SharedDisplaySocket(window.uuid);
     window._sharedDisplaySocket = sharedDisplaySocket;
 
@@ -272,148 +430,28 @@
           const assignedUUID = uuids[counter] || '';
           const thisCounter = counter; // capture for closure
           if (assignedUUID) {
-            // Create label div
             const label = document.createElement('div');
             label.className = 'canvas-label';
             label.innerHTML = `<span class="canvas-label-counter">${thisCounter}</span><span class="canvas-label-ready">ready</span><span class="canvas-label-uuid">${assignedUUID}</span>`;
             outer.insertBefore(label, container);
-            let p5inst = new p5((sk) => {
-              sk.setup = function() {
-                sk.pixelDensity(1);
-                sk.createCanvas(canvasWidthPx, canvasHeightPx).parent(container);
-                sk.background(255);
-                sk.width = canvasWidthPx;
-                sk.height = canvasHeightPx;
-                sk.ctx2d = (sk._renderer && sk._renderer.drawingContext) || null;
 
-                sk.uuid = sk.uuid || assignedUUID;
-                sk.webviewuuid = sk.webviewuuid || window.webviewuuid || window.uuid;
+            const canvasEl = document.createElement('canvas');
+            canvasEl.width = canvasWidthPx;
+            canvasEl.height = canvasHeightPx;
+            canvasEl.style.width = cssCanvasWidth + 'px';
+            canvasEl.style.height = cssCanvasHeight + 'px';
+            canvasEl.style.display = 'block';
+            canvasEl.style.margin = '0';
+            canvasEl.style.padding = '0';
+            canvasEl.style.border = 'none';
+            canvasEl.style.background = '#fff';
+            container.appendChild(canvasEl);
+            gridCanvases.push(canvasEl);
 
-                sk.pendingPayloads = [];
-                sk.frameProcessing = false;
-
-                const handleIncomingFrame = (payload) => {
-                  const pixelsField = payload && payload.pixels;
-                  const hasPixels = Array.isArray(pixelsField) || pixelsField instanceof Uint8Array || pixelsField instanceof Uint8ClampedArray;
-                  if (payload.uuid === sk.uuid && hasPixels) {
-                    label.style.display = 'none';
-                    sk.enqueuePixelPayload(payload);
-                  }
-                };
-                sharedDisplaySocket.register(sk.uuid, handleIncomingFrame);
-              };
-              sk.enqueuePixelPayload = function(payload) {
-                if (!payload) return;
-                sk.pendingPayloads.push(payload);
-                if (!sk.frameProcessing) {
-                  sk.frameProcessing = true;
-                  window.requestAnimationFrame(sk.flushPendingPayloads);
-                }
-              };
-              sk.flushPendingPayloads = function() {
-                if (!sk.pendingPayloads.length) {
-                  sk.frameProcessing = false;
-                  return;
-                }
-                while (sk.pendingPayloads.length) {
-                  const payload = sk.pendingPayloads.shift();
-                  sk.applyPixelPayload(payload);
-                }
-                window.requestAnimationFrame(sk.flushPendingPayloads);
-              };
-              sk.applyPixelPayload = function(payload) {
-                const rawPixels = payload && payload.pixels;
-                const isArray = Array.isArray(rawPixels);
-                const isTypedArray = rawPixels instanceof Uint8Array || rawPixels instanceof Uint8ClampedArray;
-                if (!payload || (!isArray && !isTypedArray)) {
-                  return;
-                }
-                const typedPixels = rawPixels instanceof Uint8ClampedArray
-                  ? rawPixels
-                  : Uint8ClampedArray.from(rawPixels);
-                const targetWidth = sk.width;
-                const targetHeight = sk.height;
-                const ctx = sk.ctx2d;
-                if (!ctx) {
-                  return;
-                }
-                const ensureImageData = (pixelData, w, h) => {
-                  try {
-                    return new ImageData(pixelData, w, h);
-                  } catch (err) {
-                    const imageData = ctx.createImageData(w, h);
-                    imageData.data.set(pixelData);
-                    return imageData;
-                  }
-                };
-                const writeRegion = (srcWidth, srcHeight, offsetX, offsetY) => {
-                  const expected = srcWidth * srcHeight * 4;
-                  if (typedPixels.length !== expected) {
-                    console.warn('[Display] Region payload length mismatch', expected, typedPixels.length);
-                    return false;
-                  }
-                  let destX = Number.isFinite(offsetX) ? Math.floor(offsetX) : 0;
-                  let destY = Number.isFinite(offsetY) ? Math.floor(offsetY) : 0;
-                  const srcWidthClamped = Math.max(1, Math.floor(srcWidth));
-                  const srcHeightClamped = Math.max(1, Math.floor(srcHeight));
-                  if (destX >= targetWidth || destY >= targetHeight) {
-                    return false;
-                  }
-                  let srcOffsetX = 0;
-                  let srcOffsetY = 0;
-                  if (destX < 0) {
-                    srcOffsetX = -destX;
-                    destX = 0;
-                  }
-                  if (destY < 0) {
-                    srcOffsetY = -destY;
-                    destY = 0;
-                  }
-                  const copyWidth = Math.min(srcWidthClamped - srcOffsetX, targetWidth - destX);
-                  const copyHeight = Math.min(srcHeightClamped - srcOffsetY, targetHeight - destY);
-                  if (copyWidth <= 0 || copyHeight <= 0) {
-                    return false;
-                  }
-                  const srcStride = srcWidthClamped * 4;
-                  const needsCrop = srcOffsetX !== 0 || srcOffsetY !== 0 || copyWidth !== srcWidthClamped || copyHeight !== srcHeightClamped;
-                  let payload = typedPixels;
-                  if (needsCrop) {
-                    payload = new Uint8ClampedArray(copyWidth * copyHeight * 4);
-                    for (let row = 0; row < copyHeight; row++) {
-                      const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
-                      const destIndex = row * copyWidth * 4;
-                      const rowSlice = typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4);
-                      payload.set(rowSlice, destIndex);
-                    }
-                  }
-                  const imageData = ensureImageData(payload, copyWidth, copyHeight);
-                  ctx.putImageData(imageData, destX, destY);
-                  return true;
-                };
-
-                if (payload.region && !payload.isFullFrame) {
-                  const region = payload.region || {};
-                  const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
-                  const regionHeight = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
-                  if (!regionWidth || !regionHeight) {
-                    return;
-                  }
-                  writeRegion(regionWidth, regionHeight, region.x, region.y);
-                  return;
-                }
-
-                const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
-                const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
-                if (fullWidth === targetWidth && fullHeight === targetHeight && typedPixels.length === sk.width * sk.height * 4) {
-                  const imageData = ensureImageData(typedPixels, targetWidth, targetHeight);
-                  ctx.putImageData(imageData, 0, 0);
-                  return;
-                }
-                writeRegion(fullWidth, fullHeight, 0, 0);
-              };
-              sk.uuid = assignedUUID;
-            }, container);
-            gridCanvases.push(container.querySelector('canvas'));
+            canvasRenderer.registerCanvas(assignedUUID, canvasEl, label);
+            sharedDisplaySocket.register(assignedUUID, (payload) => {
+              canvasRenderer.enqueue(assignedUUID, payload);
+            });
           } else {
             // Show a blank or placeholder canvas and overlay label 'available'
             const placeholder = document.createElement('canvas');

@@ -26,13 +26,18 @@ wss.on('connection', (ws) => {
                 return;
             }
             const webviewuuid = data.webviewuuid;
-            const uuid = normalizeUuid(data.uuid);
             const senderId = data.senderId || 'none';
-            const entry = ensureEntry(webviewuuid, uuid);
-            const key = makeKey(webviewuuid, uuid);
+            const targetUuids = getTargetUuids(data);
+            if (!targetUuids.length) {
+                console.log('[WS] No valid UUID targets in payload');
+                return;
+            }
             const isDisplayRegistration = isDisplayHandshake(data);
 
             if (isDisplayRegistration) {
+                const uuid = targetUuids[0];
+                const entry = ensureEntry(webviewuuid, uuid);
+                const key = makeKey(webviewuuid, uuid);
                 if (entry.display && entry.display !== ws) {
                     try {
                         entry.display.close(1000, 'Display replaced');
@@ -46,30 +51,51 @@ wss.on('connection', (ws) => {
                 return;
             }
 
-            if (!entry.senders.has(ws)) {
-                entry.senders.add(ws);
-                ws.senderRegistrations.add(key);
-                console.log(`[${webviewuuid}/${uuid}] Sender client registered (senderId: ${senderId})`);
-            }
+            const typedPixels = normalizePixels(data.pixels);
+            const region = sanitizeRegion(data.region, typedPixels.length);
+            const headerBase = {
+                region,
+                isFullFrame: !!data.isFullFrame,
+                fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : undefined,
+                fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined,
+                pixelLength: typedPixels.length
+            };
 
-            const displayWs = entry.display;
-            if (displayWs && displayWs.readyState === WebSocket.OPEN) {
-                const typedPixels = normalizePixels(data.pixels);
-                const region = sanitizeRegion(data.region, typedPixels.length);
+            const batchesByDisplay = new Map();
+
+            targetUuids.forEach((uuid) => {
+                const entry = ensureEntry(webviewuuid, uuid);
+                const key = makeKey(webviewuuid, uuid);
+                if (!entry.senders.has(ws)) {
+                    entry.senders.add(ws);
+                    ws.senderRegistrations.add(key);
+                    console.log(`[${webviewuuid}/${uuid}] Sender client registered (senderId: ${senderId})`);
+                }
+                const displayWs = entry.display;
+                if (displayWs && displayWs.readyState === WebSocket.OPEN) {
+                    let batch = batchesByDisplay.get(displayWs);
+                    if (!batch) {
+                        batch = [];
+                        batchesByDisplay.set(displayWs, batch);
+                    }
+                    batch.push(uuid);
+                } else {
+                    console.log(`[${webviewuuid}/${uuid}] No display client to send pixel data`);
+                }
+            });
+
+            batchesByDisplay.forEach((uuidsForDisplay, displayWs) => {
+                if (!uuidsForDisplay.length) {
+                    return;
+                }
                 const header = {
-                    uuid,
-                    region,
-                    isFullFrame: !!data.isFullFrame,
-                    fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : undefined,
-                    fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined,
-                    pixelLength: typedPixels.length
+                    ...headerBase,
+                    uuids: uuidsForDisplay
                 };
                 const frameBuffer = encodeBinaryFrame(header, typedPixels);
                 displayWs.send(frameBuffer, { binary: true });
-                console.log(`[${webviewuuid}/${uuid}] Pixel data sent to display client (${typedPixels.length} bytes${region ? ', region' : ', full frame'})`);
-            } else {
-                console.log(`[${webviewuuid}/${uuid}] No display client to send pixel data`);
-            }
+                console.log(`[${webviewuuid}] Pixel data sent to display client for ${uuidsForDisplay.length} canvas(es) (${typedPixels.length} bytes${region ? ', region' : ', full frame'})`);
+            });
         } catch (e) {
             console.error('[WS] Failed to parse message:', e);
             try {
@@ -116,10 +142,12 @@ function sanitizeRegion(region, pixelLength) {
 }
 
 function isValidPayload(data) {
-    return data &&
-        typeof data.webviewuuid === 'string' &&
-        (typeof data.uuid === 'string' || typeof data.uuid === 'number') &&
-        Array.isArray(data.pixels);
+    if (!data || typeof data.webviewuuid !== 'string' || !Array.isArray(data.pixels)) {
+        return false;
+    }
+    const hasSingle = typeof data.uuid === 'string' || typeof data.uuid === 'number';
+    const hasBatch = Array.isArray(data.uuids) && data.uuids.length > 0;
+    return hasSingle || hasBatch;
 }
 
 function normalizeUuid(value) {
@@ -130,6 +158,16 @@ function normalizeUuid(value) {
         return value;
     }
     return '';
+}
+
+function getTargetUuids(data) {
+    if (Array.isArray(data.uuids) && data.uuids.length > 0) {
+        return data.uuids
+            .map(normalizeUuid)
+            .filter((val) => typeof val === 'string' && val.length > 0);
+    }
+    const single = normalizeUuid(data.uuid);
+    return single ? [single] : [];
 }
 
 function normalizePixels(raw) {
