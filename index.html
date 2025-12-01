@@ -197,6 +197,7 @@
           return;
         }
         if (Array.isArray(data.uuids) && data.uuids.length) {
+          const totalTargets = data.uuids.length;
           data.uuids.forEach((targetUuid) => {
             const handler = this.handlers.get(targetUuid);
             if (handler) {
@@ -207,7 +208,11 @@
                 isFullFrame: data.isFullFrame,
                 fullWidth: data.fullWidth,
                 fullHeight: data.fullHeight,
-                pixelLength: data.pixelLength
+                pixelLength: data.pixelLength,
+                pixelBuffer: data.pixelBuffer,
+                pixelByteOffset: data.pixelByteOffset,
+                pixelByteLength: data.pixelByteLength,
+                sharedTargetCount: totalTargets
               });
             }
           });
@@ -215,6 +220,9 @@
         }
         if (typeof data.uuid === 'undefined') {
           return;
+        }
+        if (typeof data.sharedTargetCount === 'undefined') {
+          data.sharedTargetCount = 1;
         }
         const handler = this.handlers.get(data.uuid);
         if (handler) {
@@ -248,6 +256,10 @@
         }
         const pixelBytesLength = buffer.byteLength - totalHeaderBytes;
         metadata.pixels = new Uint8ClampedArray(buffer, totalHeaderBytes, pixelBytesLength);
+        metadata.pixelBuffer = buffer;
+        metadata.pixelByteOffset = totalHeaderBytes;
+        metadata.pixelByteLength = pixelBytesLength;
+        metadata.pixelLength = pixelBytesLength;
         return metadata;
       }
     }
@@ -393,7 +405,149 @@
       }
     }
 
-    const canvasRenderer = new CanvasRenderManager();
+    class OffscreenCanvasManager {
+      constructor(workerScriptUrl) {
+        this.workerScriptUrl = workerScriptUrl;
+        this.entries = new Map();
+        this.fallback = new CanvasRenderManager();
+      }
+
+      registerCanvas(uuid, canvasElement, labelElement) {
+        if (typeof canvasElement.transferControlToOffscreen !== 'function') {
+          this.fallback.registerCanvas(uuid, canvasElement, labelElement);
+          this.entries.set(uuid, { fallback: true });
+          return;
+        }
+        let worker;
+        try {
+          worker = new Worker(this.workerScriptUrl, { name: `display-worker-${uuid}` });
+        } catch (err) {
+          console.warn('[OffscreenRenderer] Failed to create worker', err);
+          this.fallback.registerCanvas(uuid, canvasElement, labelElement);
+          this.entries.set(uuid, { fallback: true });
+          return;
+        }
+        let offscreen;
+        try {
+          offscreen = canvasElement.transferControlToOffscreen();
+        } catch (err) {
+          console.warn('[OffscreenRenderer] transferControlToOffscreen failed', err);
+          worker.terminate();
+          this.fallback.registerCanvas(uuid, canvasElement, labelElement);
+          this.entries.set(uuid, { fallback: true });
+          return;
+        }
+        worker.postMessage({
+          type: 'init',
+          uuid,
+          width: canvasElement.width,
+          height: canvasElement.height,
+          canvas: offscreen
+        }, [offscreen]);
+        this.entries.set(uuid, {
+          worker,
+          label: labelElement,
+          canvasWidth: canvasElement.width,
+          canvasHeight: canvasElement.height,
+          fallback: false
+        });
+      }
+
+      enqueue(uuid, payload) {
+        const entry = this.entries.get(uuid);
+        if (!entry) {
+          return;
+        }
+        if (entry.fallback) {
+          this.fallback.enqueue(uuid, payload);
+          return;
+        }
+        if (entry.label) {
+          entry.label.style.display = 'none';
+          entry.label = null;
+        }
+        const { message, transferables } = this.buildFrameMessage(payload, entry);
+        entry.worker.postMessage(message, transferables);
+      }
+
+      buildFrameMessage(payload, entry) {
+        const targetCount = payload && payload.sharedTargetCount ? payload.sharedTargetCount : 1;
+        const frame = {
+          type: 'frame',
+          uuid: payload ? payload.uuid : undefined,
+          region: payload && payload.region ? {
+            x: Number(payload.region.x) || 0,
+            y: Number(payload.region.y) || 0,
+            width: Number(payload.region.width) || 0,
+            height: Number(payload.region.height) || 0
+          } : null,
+          isFullFrame: Boolean(payload && payload.isFullFrame),
+          fullWidth: payload && Number.isFinite(payload.fullWidth) ? payload.fullWidth : entry.canvasWidth,
+          fullHeight: payload && Number.isFinite(payload.fullHeight) ? payload.fullHeight : entry.canvasHeight,
+          pixelLength: payload && payload.pixelLength ? payload.pixelLength : 0,
+          canvasWidth: entry.canvasWidth,
+          canvasHeight: entry.canvasHeight
+        };
+        const bufferInfo = this.extractTransferableBuffer(payload, targetCount);
+        const transferables = [];
+        if (bufferInfo) {
+          frame.buffer = bufferInfo.buffer;
+          frame.byteOffset = bufferInfo.byteOffset;
+          frame.byteLength = bufferInfo.byteLength;
+          transferables.push(bufferInfo.buffer);
+        } else if (payload && payload.pixels) {
+          const clone = payload.pixels instanceof Uint8ClampedArray
+            ? payload.pixels.slice()
+            : new Uint8ClampedArray(payload.pixels);
+          frame.buffer = clone.buffer;
+          frame.byteOffset = clone.byteOffset;
+          frame.byteLength = clone.byteLength;
+          transferables.push(clone.buffer);
+        } else {
+          frame.buffer = null;
+          frame.byteOffset = 0;
+          frame.byteLength = 0;
+        }
+        return { message: frame, transferables };
+      }
+
+      extractTransferableBuffer(payload, targetCount) {
+        if (!payload) {
+          return null;
+        }
+        const hasPixelBuffer = payload.pixelBuffer instanceof ArrayBuffer;
+        const hasTypedArray = payload.pixels instanceof Uint8Array || payload.pixels instanceof Uint8ClampedArray;
+        let sourceBuffer = null;
+        let byteOffset = 0;
+        let byteLength = 0;
+        if (hasPixelBuffer) {
+          sourceBuffer = payload.pixelBuffer;
+          byteOffset = payload.pixelByteOffset || 0;
+          byteLength = payload.pixelByteLength || payload.pixelLength || 0;
+        } else if (hasTypedArray) {
+          sourceBuffer = payload.pixels.buffer;
+          byteOffset = payload.pixels.byteOffset;
+          byteLength = payload.pixels.byteLength;
+        }
+        if (!sourceBuffer || !byteLength) {
+          return null;
+        }
+        if (targetCount > 1) {
+          const clonedBuffer = sourceBuffer.slice(byteOffset, byteOffset + byteLength);
+          return {
+            buffer: clonedBuffer,
+            byteOffset: 0,
+            byteLength: clonedBuffer.byteLength
+          };
+        }
+        return { buffer: sourceBuffer, byteOffset, byteLength };
+      }
+    }
+
+    const supportsOffscreenWorkers = typeof window.OffscreenCanvas === 'function' && typeof window.Worker === 'function';
+    const canvasRenderer = supportsOffscreenWorkers
+      ? new OffscreenCanvasManager('/p5/display-worker.js')
+      : new CanvasRenderManager();
     const sharedDisplaySocket = window._sharedDisplaySocket || new SharedDisplaySocket(window.uuid);
     window._sharedDisplaySocket = sharedDisplaySocket;
 
