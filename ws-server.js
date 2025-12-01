@@ -54,17 +54,19 @@ wss.on('connection', (ws) => {
 
             const displayWs = entry.display;
             if (displayWs && displayWs.readyState === WebSocket.OPEN) {
-                const region = sanitizeRegion(data.region);
-                const payload = {
+                const typedPixels = normalizePixels(data.pixels);
+                const region = sanitizeRegion(data.region, typedPixels.length);
+                const header = {
                     uuid,
-                    pixels: data.pixels,
                     region,
                     isFullFrame: !!data.isFullFrame,
                     fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : undefined,
-                    fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined
+                    fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined,
+                    pixelLength: typedPixels.length
                 };
-                displayWs.send(JSON.stringify(payload));
-                console.log(`[${webviewuuid}/${uuid}] Pixel data sent to display client (${data.pixels.length} values${region ? ', region' : ', full frame'})`);
+                const frameBuffer = encodeBinaryFrame(header, typedPixels);
+                displayWs.send(frameBuffer, { binary: true });
+                console.log(`[${webviewuuid}/${uuid}] Pixel data sent to display client (${typedPixels.length} bytes${region ? ', region' : ', full frame'})`);
             } else {
                 console.log(`[${webviewuuid}/${uuid}] No display client to send pixel data`);
             }
@@ -85,13 +87,31 @@ wss.on('connection', (ws) => {
 
 console.log('WebSocket server running on ws://localhost:3001');
 
-function sanitizeRegion(region) {
+function sanitizeRegion(region, pixelLength) {
     if (!region || typeof region !== 'object') return null;
-    const x = Number.isFinite(region.x) ? Math.max(0, region.x) : 0;
-    const y = Number.isFinite(region.y) ? Math.max(0, region.y) : 0;
-    const width = Number.isFinite(region.width) ? Math.max(1, region.width) : null;
-    const height = Number.isFinite(region.height) ? Math.max(1, region.height) : null;
-    if (!width || !height) return null;
+    const totalPixels = (pixelLength && pixelLength % 4 === 0) ? pixelLength / 4 : null;
+    let width = Number.isFinite(region.width) ? region.width : null;
+    let height = Number.isFinite(region.height) ? region.height : null;
+
+    if (totalPixels && (!width || !height)) {
+        if (!width && height) {
+            width = totalPixels / height;
+        } else if (!height && width) {
+            height = totalPixels / width;
+        } else if (!width && !height) {
+            // Assume square region if both dimensions missing
+            const side = Math.sqrt(totalPixels);
+            width = side;
+            height = side;
+        }
+    }
+
+    if (!width || !height || width <= 0 || height <= 0 || !Number.isFinite(width) || !Number.isFinite(height)) {
+        return null;
+    }
+
+    const x = Number.isFinite(region.x) ? region.x : 0;
+    const y = Number.isFinite(region.y) ? region.y : 0;
     return { x, y, width, height };
 }
 
@@ -110,6 +130,36 @@ function normalizeUuid(value) {
         return value;
     }
     return '';
+}
+
+function normalizePixels(raw) {
+    if (!raw) {
+        return new Uint8Array(0);
+    }
+    if (raw instanceof Uint8Array || raw instanceof Uint8ClampedArray) {
+        return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    }
+    if (Array.isArray(raw)) {
+        return Uint8Array.from(raw);
+    }
+    if (Buffer.isBuffer(raw)) {
+        return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    }
+    return new Uint8Array(0);
+}
+
+function encodeBinaryFrame(header, pixelArray) {
+    const headerJson = JSON.stringify(header);
+    const headerBuf = Buffer.from(headerJson, 'utf8');
+    const pixelView = pixelArray instanceof Uint8Array ? pixelArray : new Uint8Array(pixelArray || []);
+    const pixelBuf = Buffer.from(pixelView.buffer, pixelView.byteOffset, pixelView.byteLength);
+    const frame = Buffer.allocUnsafe(4 + headerBuf.length + pixelBuf.length);
+    frame.writeUInt32BE(headerBuf.length, 0);
+    headerBuf.copy(frame, 4);
+    if (pixelBuf.length > 0) {
+        pixelBuf.copy(frame, 4 + headerBuf.length);
+    }
+    return frame;
 }
 
 function isDisplayHandshake(data) {

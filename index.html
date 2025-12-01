@@ -108,12 +108,14 @@
         this.ws = null;
         this.reconnectDelay = 1000;
         this.reconnectTimer = null;
+        this.decoder = typeof window.TextDecoder === 'function' ? new window.TextDecoder() : null;
         this.connect();
       }
 
       connect() {
         try {
           this.ws = new window.WebSocket('ws://localhost:3001');
+          this.ws.binaryType = 'arraybuffer';
         } catch (err) {
           console.error('[DisplaySocket] Failed to create WebSocket', err);
           this.scheduleReconnect();
@@ -166,20 +168,35 @@
       }
 
       handleMessage(event) {
-        let data;
         if (typeof event.data === 'string') {
           try {
-            data = JSON.parse(event.data);
+            const parsed = JSON.parse(event.data);
+            this.dispatchPayload(parsed);
           } catch (err) {
-            console.warn('[DisplaySocket] Failed to parse message', err);
-            return;
+            console.warn('[DisplaySocket] Failed to parse text message', err);
           }
-        } else if (event.data instanceof ArrayBuffer) {
-          // Assume binary messages are not used for now
-          return;
-        } else {
           return;
         }
+        if (event.data instanceof ArrayBuffer) {
+          const payload = this.decodeBinaryFrame(event.data);
+          if (payload) {
+            this.dispatchPayload(payload);
+          }
+          return;
+        }
+        if (event.data instanceof Blob && typeof event.data.arrayBuffer === 'function') {
+          event.data.arrayBuffer()
+            .then((buffer) => {
+              const payload = this.decodeBinaryFrame(buffer);
+              if (payload) {
+                this.dispatchPayload(payload);
+              }
+            })
+            .catch((err) => console.warn('[DisplaySocket] Failed to decode blob message', err));
+        }
+      }
+
+      dispatchPayload(data) {
         if (!data || typeof data.uuid === 'undefined') {
           return;
         }
@@ -187,6 +204,35 @@
         if (handler) {
           handler(data);
         }
+      }
+
+      decodeBinaryFrame(buffer) {
+        if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 4) {
+          return null;
+        }
+        const headerLength = new DataView(buffer, 0, 4).getUint32(0, false);
+        const totalHeaderBytes = 4 + headerLength;
+        if (buffer.byteLength < totalHeaderBytes) {
+          console.warn('[DisplaySocket] Binary frame shorter than header length');
+          return null;
+        }
+        const headerBytes = new Uint8Array(buffer, 4, headerLength);
+        let headerText;
+        if (this.decoder) {
+          headerText = this.decoder.decode(headerBytes);
+        } else {
+          headerText = String.fromCharCode.apply(null, headerBytes);
+        }
+        let metadata;
+        try {
+          metadata = JSON.parse(headerText);
+        } catch (err) {
+          console.warn('[DisplaySocket] Failed to parse binary header', err);
+          return null;
+        }
+        const pixelBytesLength = buffer.byteLength - totalHeaderBytes;
+        metadata.pixels = new Uint8ClampedArray(buffer, totalHeaderBytes, pixelBytesLength);
+        return metadata;
       }
     }
 
@@ -243,7 +289,7 @@
                 sk.uuid = sk.uuid || assignedUUID;
                 sk.webviewuuid = sk.webviewuuid || window.webviewuuid || window.uuid;
 
-                sk.latestPayload = null;
+                sk.pendingPayloads = [];
                 sk.frameProcessing = false;
 
                 const handleIncomingFrame = (payload) => {
@@ -257,21 +303,23 @@
                 sharedDisplaySocket.register(sk.uuid, handleIncomingFrame);
               };
               sk.enqueuePixelPayload = function(payload) {
-                sk.latestPayload = payload;
+                if (!payload) return;
+                sk.pendingPayloads.push(payload);
                 if (!sk.frameProcessing) {
                   sk.frameProcessing = true;
-                  window.requestAnimationFrame(sk.flushLatestPayload);
+                  window.requestAnimationFrame(sk.flushPendingPayloads);
                 }
               };
-              sk.flushLatestPayload = function() {
-                if (!sk.latestPayload) {
+              sk.flushPendingPayloads = function() {
+                if (!sk.pendingPayloads.length) {
                   sk.frameProcessing = false;
                   return;
                 }
-                const payload = sk.latestPayload;
-                sk.latestPayload = null;
-                sk.applyPixelPayload(payload);
-                window.requestAnimationFrame(sk.flushLatestPayload);
+                while (sk.pendingPayloads.length) {
+                  const payload = sk.pendingPayloads.shift();
+                  sk.applyPixelPayload(payload);
+                }
+                window.requestAnimationFrame(sk.flushPendingPayloads);
               };
               sk.applyPixelPayload = function(payload) {
                 const rawPixels = payload && payload.pixels;

@@ -1,22 +1,26 @@
 
 // Patch: Export as testSetup and testDrawPixels for grid integration
 this.testSetup = function () {
-    let sk = this;
+    const sk = this;
+    sk.pixelDensity(1);
+    sk.createCanvas(sk.width, sk.height);
+    sk.background(220);
+
     sk.statusDiv = sk.createDiv('WebSocket: connecting...');
     sk.statusDiv.style('font-family', 'monospace');
     sk.statusDiv.style('font-size', '14px');
     sk.statusDiv.position(10, sk.height + 10);
 
-    // Use uuid/webviewuuid from p5 instance if present, else window
     sk.uuid = sk.uuid || window.uuid;
     sk.webviewuuid = sk.webviewuuid || window.webviewuuid || window.uuid;
 
-    sk.createCanvas(sk.width, sk.height);
-    sk.background(220);
+    sk.pendingPayloads = [];
+    sk.frameProcessing = false;
+    sk.decoder = typeof window.TextDecoder === 'function' ? new window.TextDecoder() : null;
 
     sk.ws = new window.WebSocket('ws://localhost:3001');
+    sk.ws.binaryType = 'arraybuffer';
     sk.ws.onopen = () => {
-        console.log('[WebSocket] Connection opened');
         sk.statusDiv.html('WebSocket: connected');
         sk.ws.send(JSON.stringify({
             webviewuuid: sk.webviewuuid,
@@ -24,119 +28,133 @@ this.testSetup = function () {
             pixels: []
         }));
     };
-    sk.ws.onclose = (event) => {
-        console.log('[WebSocket] Connection closed', event);
+    sk.ws.onclose = () => {
         sk.statusDiv.html('WebSocket: closed');
     };
-    sk.ws.onerror = (event) => {
-        console.error('[WebSocket] Error', event);
+    sk.ws.onerror = () => {
         sk.statusDiv.html('WebSocket: error');
     };
-    sk.latestPayload = null;
-    if (payload.region && !payload.isFullFrame) {
-        const region = payload.region || {};
-        const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
-        const regionHeight = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
-        if (!regionWidth || !regionHeight) {
+    sk.ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+            try {
+                const parsed = JSON.parse(event.data);
+                sk.enqueuePixelPayload(parsed);
+            } catch (err) {
+                console.warn('[Test Display] Failed to parse text payload', err);
+            }
             return;
         }
-        const expected = regionWidth * regionHeight * 4;
-        if (typedPixels.length < expected) {
+        if (event.data instanceof ArrayBuffer) {
+            const payload = decodeBinaryFrame(event.data, sk.decoder);
+            if (payload) {
+                sk.enqueuePixelPayload(payload);
+            }
             return;
         }
-        let destX = Number.isFinite(region.x) ? Math.floor(region.x) : 0;
-        let destY = Number.isFinite(region.y) ? Math.floor(region.y) : 0;
-        if (destX >= targetWidth || destY >= targetHeight) {
-            return;
+        if (event.data instanceof Blob && typeof event.data.arrayBuffer === 'function') {
+            event.data.arrayBuffer()
+                .then((buffer) => {
+                    const payload = decodeBinaryFrame(buffer, sk.decoder);
+                    if (payload) {
+                        sk.enqueuePixelPayload(payload);
+                    }
+                })
+                .catch((err) => console.warn('[Test Display] Failed to decode blob payload', err));
         }
-        if (destX < 0) destX = 0;
-        if (destY < 0) destY = 0;
-        try {
-            const imageData = new ImageData(typedPixels, regionWidth, regionHeight);
-            sk.drawingContext.putImageData(imageData, destX, destY);
-        } catch (err) {
-            console.warn('[Test Display] Failed to draw region payload', err);
-        }
-        return;
-    }
-    const payload = sk.latestPayload;
-    sk.latestPayload = null;
-    sk.applyPixelPayload(payload);
-    window.requestAnimationFrame(() => sk.flushLatestPayload());
-};
-
-this.applyPixelPayload = function (payload) {
-    let sk = this;
-    const rawPixels = payload && payload.pixels;
-    const isArray = Array.isArray(rawPixels);
-    const isTypedArray = rawPixels instanceof Uint8Array || rawPixels instanceof Uint8ClampedArray;
-    if (!payload || (!isArray && !isTypedArray)) {
-        return;
-    }
-    const typedPixels = rawPixels instanceof Uint8ClampedArray
-        ? rawPixels
-        : Uint8ClampedArray.from(rawPixels);
-    const targetWidth = sk.width;
-    const targetHeight = sk.height;
-    const targetStride = targetWidth * 4;
-    const writeRegion = (srcWidth, srcHeight, offsetX, offsetY) => {
-        const expected = srcWidth * srcHeight * 4;
-        if (typedPixels.length !== expected) {
-            console.warn('[Test Display] Region payload length mismatch', expected, typedPixels.length);
-            return false;
-        }
-        let destX = Number.isFinite(offsetX) ? Math.floor(offsetX) : 0;
-        let destY = Number.isFinite(offsetY) ? Math.floor(offsetY) : 0;
-        const srcWidthClamped = Math.max(1, Math.floor(srcWidth));
-        const srcHeightClamped = Math.max(1, Math.floor(srcHeight));
-        if (destX >= targetWidth || destY >= targetHeight) {
-            return false;
-        }
-        let srcOffsetX = 0;
-        let srcOffsetY = 0;
-        if (destX < 0) {
-            srcOffsetX = -destX;
-            destX = 0;
-        }
-        if (destY < 0) {
-            srcOffsetY = -destY;
-            destY = 0;
-        }
-        const copyWidth = Math.min(srcWidthClamped - srcOffsetX, targetWidth - destX);
-        const copyHeight = Math.min(srcHeightClamped - srcOffsetY, targetHeight - destY);
-        if (copyWidth <= 0 || copyHeight <= 0) {
-            return false;
-        }
-        const srcStride = srcWidthClamped * 4;
-        sk.loadPixels();
-        for (let row = 0; row < copyHeight; row++) {
-            const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
-            const destIndex = ((destY + row) * targetStride) + (destX * 4);
-            const rowSlice = typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4);
-            sk.pixels.set(rowSlice, destIndex);
-        }
-        sk.updatePixels();
-        return true;
     };
 
-    if (payload.region && !payload.isFullFrame) {
-        const region = payload.region || {};
-        const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
-        const regionHeight = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
-        if (!regionWidth || !regionHeight) {
+    sk.enqueuePixelPayload = function (payload) {
+        if (!payload) return;
+        sk.pendingPayloads.push(payload);
+        if (!sk.frameProcessing) {
+            sk.frameProcessing = true;
+            window.requestAnimationFrame(sk.flushPendingPayloads.bind(sk));
+        }
+    };
+
+    sk.flushPendingPayloads = function () {
+        if (!sk.pendingPayloads.length) {
+            sk.frameProcessing = false;
             return;
         }
-        writeRegion(regionWidth, regionHeight, region.x, region.y);
-        return;
-    }
+        while (sk.pendingPayloads.length) {
+            const nextPayload = sk.pendingPayloads.shift();
+            sk.applyPixelPayload(nextPayload);
+        }
+        window.requestAnimationFrame(sk.flushPendingPayloads.bind(sk));
+    };
 
-    const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
-    const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
-    if (fullWidth === targetWidth && fullHeight === targetHeight && typedPixels.length === sk.width * sk.height * 4) {
+    sk.applyPixelPayload = function (payload) {
+        const rawPixels = payload && payload.pixels;
+        if (!payload || (!Array.isArray(rawPixels) && !(rawPixels instanceof Uint8Array) && !(rawPixels instanceof Uint8ClampedArray))) {
+            return;
+        }
+        const typedPixels = rawPixels instanceof Uint8ClampedArray
+            ? rawPixels
+            : new Uint8ClampedArray(rawPixels);
+        const ctx = sk.drawingContext;
+        if (!ctx) {
+            return;
+        }
+
+        const drawRegion = (region) => {
+            const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
+            const regionHeight = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
+            if (!regionWidth || !regionHeight) return;
+            try {
+                const imageData = new ImageData(typedPixels, regionWidth, regionHeight);
+                const destX = Number.isFinite(region.x) ? Math.floor(region.x) : 0;
+                const destY = Number.isFinite(region.y) ? Math.floor(region.y) : 0;
+                ctx.putImageData(imageData, destX, destY);
+            } catch (err) {
+                console.warn('[Test Display] Failed to draw region payload', err);
+            }
+        };
+
+        if (payload.region && !payload.isFullFrame) {
+            drawRegion(payload.region);
+            return;
+        }
+
+        const targetWidth = sk.width;
+        const targetHeight = sk.height;
+        if (typedPixels.length !== targetWidth * targetHeight * 4) {
+            // Fallback: draw as region covering the payload dimensions if provided
+            const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
+            const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
+            drawRegion({ x: 0, y: 0, width: fullWidth, height: fullHeight });
+            return;
+        }
         sk.loadPixels();
         sk.pixels.set(typedPixels);
         sk.updatePixels();
-        return;
+    };
+
+    function decodeBinaryFrame(buffer, decoder) {
+        if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 4) {
+            return null;
+        }
+        const headerLength = new DataView(buffer, 0, 4).getUint32(0, false);
+        const totalHeaderBytes = 4 + headerLength;
+        if (buffer.byteLength < totalHeaderBytes) {
+            return null;
+        }
+        const headerBytes = new Uint8Array(buffer, 4, headerLength);
+        let headerText;
+        if (decoder) {
+            headerText = decoder.decode(headerBytes);
+        } else {
+            headerText = String.fromCharCode.apply(null, headerBytes);
+        }
+        let metadata;
+        try {
+            metadata = JSON.parse(headerText);
+        } catch (err) {
+            console.warn('[Test Display] Failed to parse binary header', err);
+            return null;
+        }
+        const pixelBytesLength = buffer.byteLength - totalHeaderBytes;
+        metadata.pixels = new Uint8ClampedArray(buffer, totalHeaderBytes, pixelBytesLength);
+        return metadata;
     }
-    writeRegion(fullWidth, fullHeight, 0, 0);
 };

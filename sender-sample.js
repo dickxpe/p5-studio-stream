@@ -13,6 +13,9 @@ let ws = null;
 let reconnectTimer = null;
 const RECONNECT_DELAY_MS = 1000;
 let targetUUIDs = [...DEFAULT_UUIDS];
+const TILE_SIZE = 8;
+const MAX_TILE_RATIO = 0.6; // Fall back to full frame if >60% pixels change
+const MAX_TILE_COUNT = 200; // Or if too many tiles would be sent
 
 async function refreshUUIDs() {
     try {
@@ -130,7 +133,7 @@ function sendPixelsIfNeeded() {
         lastFrameSentAt = now;
         return;
     }
-    const diff = extractDirtyRegion(current, lastPixels, width, height);
+    const diff = extractDirtyTiles(current, lastPixels, width, height);
     if (!diff) {
         return;
     }
@@ -140,22 +143,16 @@ function sendPixelsIfNeeded() {
 }
 
 function transmitPayload(diff) {
-    if (!isSocketOpen() || targetUUIDs.length === 0) return;
-    const serializedPixels = Array.from(diff.pixels);
-    const basePayload = {
-        webviewuuid: TARGET_WEBVIEWUUID,
-        senderId,
-        pixels: serializedPixels,
-        isFullFrame: !!diff.isFullFrame,
-        fullWidth: width,
-        fullHeight: height
-    };
-    if (diff.region) {
-        basePayload.region = diff.region;
+    if (!isSocketOpen() || targetUUIDs.length === 0 || !diff) return;
+    if (diff.isFullFrame) {
+        sendPayloadToAll(diff.pixels, null, true);
+        return;
     }
-    targetUUIDs.forEach((uuid) => {
-        const payload = { ...basePayload, uuid };
-        ws.send(JSON.stringify(payload));
+    if (!Array.isArray(diff.tiles) || diff.tiles.length === 0) {
+        return;
+    }
+    diff.tiles.forEach((tile) => {
+        sendPayloadToAll(tile.pixels, tile.region, false);
     });
 }
 
@@ -163,43 +160,89 @@ function isSocketOpen() {
     return ws && ws.readyState === WebSocket.OPEN;
 }
 
-function extractDirtyRegion(current, previous, canvasWidth, canvasHeight) {
-    let minX = canvasWidth;
-    let minY = canvasHeight;
-    let maxX = -1;
-    let maxY = -1;
-    for (let i = 0; i < current.length; i += 4) {
-        if (
-            current[i] !== previous[i] ||
-            current[i + 1] !== previous[i + 1] ||
-            current[i + 2] !== previous[i + 2] ||
-            current[i + 3] !== previous[i + 3]
-        ) {
-            const pixelIndex = i / 4;
-            const x = pixelIndex % canvasWidth;
-            const y = Math.floor(pixelIndex / canvasWidth);
-            if (x < minX) minX = x;
-            if (y < minY) minY = y;
-            if (x > maxX) maxX = x;
-            if (y > maxY) maxY = y;
+function sendPayloadToAll(pixelsArray, region, isFullFrame) {
+    const serializedPixels = Array.from(pixelsArray);
+    const basePayload = {
+        webviewuuid: TARGET_WEBVIEWUUID,
+        senderId,
+        pixels: serializedPixels,
+        isFullFrame,
+        fullWidth: width,
+        fullHeight: height
+    };
+    if (region) {
+        basePayload.region = region;
+    }
+    targetUUIDs.forEach((uuid) => {
+        const payload = { ...basePayload, uuid };
+        ws.send(JSON.stringify(payload));
+    });
+}
+
+function extractDirtyTiles(current, previous, canvasWidth, canvasHeight) {
+    const tilesX = Math.ceil(canvasWidth / TILE_SIZE);
+    const tilesY = Math.ceil(canvasHeight / TILE_SIZE);
+    const totalPixels = canvasWidth * canvasHeight;
+    const changedTiles = [];
+    let changedPixels = 0;
+
+    for (let ty = 0; ty < tilesY; ty++) {
+        for (let tx = 0; tx < tilesX; tx++) {
+            const startX = tx * TILE_SIZE;
+            const startY = ty * TILE_SIZE;
+            const tileWidth = Math.min(TILE_SIZE, canvasWidth - startX);
+            const tileHeight = Math.min(TILE_SIZE, canvasHeight - startY);
+            if (tileWidth <= 0 || tileHeight <= 0) {
+                continue;
+            }
+            if (tileIsDirty(current, previous, canvasWidth, startX, startY, tileWidth, tileHeight)) {
+                const pixels = copyRegionPixels(current, canvasWidth, startX, startY, tileWidth, tileHeight);
+                changedTiles.push({
+                    region: { x: startX, y: startY, width: tileWidth, height: tileHeight },
+                    pixels
+                });
+                changedPixels += tileWidth * tileHeight;
+            }
         }
     }
-    if (maxX === -1 || maxY === -1) {
+
+    if (!changedTiles.length) {
         return null;
     }
-    const regionWidth = maxX - minX + 1;
-    const regionHeight = maxY - minY + 1;
-    const rowStride = regionWidth * 4;
-    const regionPixels = new Uint8ClampedArray(regionWidth * regionHeight * 4);
-    for (let row = 0; row < regionHeight; row++) {
-        const srcIndex = ((minY + row) * canvasWidth + minX) * 4;
-        const destIndex = row * rowStride;
-        regionPixels.set(current.subarray(srcIndex, srcIndex + rowStride), destIndex);
+
+    const changeRatio = changedPixels / totalPixels;
+    if (changeRatio >= MAX_TILE_RATIO || changedTiles.length > MAX_TILE_COUNT) {
+        return { isFullFrame: true, pixels: current };
     }
-    const coversFullFrame = minX === 0 && minY === 0 && maxX === canvasWidth - 1 && maxY === canvasHeight - 1;
-    return {
-        region: coversFullFrame ? null : { x: minX, y: minY, width: regionWidth, height: regionHeight },
-        pixels: coversFullFrame ? current : regionPixels,
-        isFullFrame: coversFullFrame
-    };
+
+    return { isFullFrame: false, tiles: changedTiles };
+}
+
+function tileIsDirty(current, previous, canvasWidth, startX, startY, regionWidth, regionHeight) {
+    for (let y = 0; y < regionHeight; y++) {
+        const baseIndex = ((startY + y) * canvasWidth + startX) * 4;
+        for (let x = 0; x < regionWidth; x++) {
+            const idx = baseIndex + x * 4;
+            if (
+                current[idx] !== previous[idx] ||
+                current[idx + 1] !== previous[idx + 1] ||
+                current[idx + 2] !== previous[idx + 2] ||
+                current[idx + 3] !== previous[idx + 3]
+            ) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function copyRegionPixels(sourcePixels, canvasWidth, startX, startY, regionWidth, regionHeight) {
+    const buffer = new Uint8ClampedArray(regionWidth * regionHeight * 4);
+    const rowStride = regionWidth * 4;
+    for (let row = 0; row < regionHeight; row++) {
+        const srcIndex = ((startY + row) * canvasWidth + startX) * 4;
+        const destIndex = row * rowStride;
+        buffer.set(sourcePixels.subarray(srcIndex, srcIndex + rowStride), destIndex);
+    }
+    return buffer;
 }
