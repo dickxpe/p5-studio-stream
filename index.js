@@ -51,6 +51,64 @@ const server = http.createServer((req, res) => {
   }
 
 
+  if (/^\/webviews\/[a-zA-Z0-9]{8}\/display-mode$/.test(req.url) && req.method === 'POST') {
+    const auth = req.headers['authorization'];
+    if (!auth || !auth.startsWith('Basic ')) {
+      res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Manage"' });
+      res.end('Authentication required');
+      return;
+    }
+    const credentials = Buffer.from(auth.split(' ')[1], 'base64').toString();
+    const [user, pass] = credentials.split(':');
+    const { verifyUser } = require('./db');
+    verifyUser(user, pass).then(valid => {
+      if (!valid) {
+        res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Manage"' });
+        res.end('Invalid credentials');
+        return;
+      }
+      let body = '';
+      req.on('data', chunk => {
+        body += chunk;
+        if (body.length > 1e4) {
+          req.connection.destroy();
+        }
+      });
+      req.on('end', () => {
+        let displayMode = 'flow';
+        try {
+          const parsed = JSON.parse(body || '{}');
+          if (typeof parsed.displayMode === 'string') {
+            displayMode = parsed.displayMode.toLowerCase();
+          }
+        } catch (e) { }
+        const allowedModes = new Set(['flow', 'fixed', 'random']);
+        if (!allowedModes.has(displayMode)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid display mode' }));
+          return;
+        }
+        const webviewuuid = req.url.split('/')[2];
+        sharedDb.run('UPDATE webviews SET display_mode = ? WHERE webviewuuid = ?', [displayMode, webviewuuid], function (err) {
+          if (err) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: err.message }));
+            return;
+          }
+          if (this.changes === 0) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Webview not found' }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, display_mode: displayMode }));
+        });
+      });
+    });
+    return;
+  }
+
+
 
 
 
@@ -135,15 +193,16 @@ const server = http.createServer((req, res) => {
           Math.random().toString(36).charAt(2)
         ).join("");
         const created_at = new Date().toISOString();
+        const displayMode = 'flow';
         // Insert new webview into webviews table
-        sharedDb.run('INSERT INTO webviews (webviewuuid, rows, columns, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?)', [webviewuuid, rows, columns, width, height, created_at], function (err) {
+        sharedDb.run('INSERT INTO webviews (webviewuuid, rows, columns, width, height, created_at, display_mode) VALUES (?, ?, ?, ?, ?, ?, ?)', [webviewuuid, rows, columns, width, height, created_at, displayMode], function (err) {
           if (err) {
             res.writeHead(500, { 'Content-Type': 'text/plain' });
             res.end('DB error: ' + err.message);
             return;
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ uuid: webviewuuid, rows, columns, width, height, created_at }));
+          res.end(JSON.stringify({ uuid: webviewuuid, rows, columns, width, height, created_at, display_mode: displayMode }));
         });
       });
     });
@@ -261,13 +320,24 @@ const server = http.createServer((req, res) => {
             const pad = (n) => String(n).padStart(2, '0');
             return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} - ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
           };
+          const buildModeOptions = (currentMode) => {
+            const normalized = (currentMode || 'flow').toLowerCase();
+            return ['flow', 'fixed', 'random']
+              .map(mode => `<option value="${mode}" ${mode === normalized ? 'selected' : ''}>${mode}</option>`)
+              .join('');
+          };
           const webviewsHtml = webviewsWithCounts.map(w => {
             const y = (w.rows || 10) * (w.columns || 10);
             const createdAt = formatDate(w.created_at);
             const deleteBtn = w.webviewuuid === 'testuuid'
               ? ''
               : `<button type="button" class="delete-btn" aria-label="Delete" data-uuid="${w.webviewuuid}"><img src="/trash-bin.png" alt="Delete" /></button>`;
-            return `<div class="webview-item"><div class="webview-info"><a href="/${w.webviewuuid}" class="webview-link"><span>${w.webviewuuid}</span></a> <span class="webview-count">(${w.uuidCount}/${y})</span><small>${createdAt}</small></div>${deleteBtn}</div>`;
+            const modeSelector = `<label class="mode-picker">mode
+              <select class="mode-select" data-uuid="${w.webviewuuid}">
+                ${buildModeOptions(w.display_mode)}
+              </select>
+            </label>`;
+            return `<div class="webview-item"><div class="webview-info"><a href="/${w.webviewuuid}" class="webview-link"><span>${w.webviewuuid}</span></a> <span class="webview-count">(${w.uuidCount}/${y})</span><small>${createdAt}</small></div><div class="webview-actions">${modeSelector}${deleteBtn}</div></div>`;
           }).join('');
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end(`<!DOCTYPE html>
@@ -369,6 +439,28 @@ const server = http.createServer((req, res) => {
                 opacity: 0.5;
                 cursor: wait;
               }
+              .webview-actions {
+                display: flex;
+                align-items: center;
+                gap: 0.75em;
+                flex-wrap: wrap;
+              }
+              .mode-picker {
+                display: flex;
+                align-items: center;
+                gap: 0.4em;
+                font-size: 0.85em;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: #446688;
+              }
+              .mode-picker select {
+                border-radius: 6px;
+                border: 1px solid #bcd3e6;
+                padding: 0.2em 0.8em;
+                font-size: 0.95em;
+                text-transform: none;
+              }
             </style>
           </head>
           <body>
@@ -399,6 +491,14 @@ const server = http.createServer((req, res) => {
                 }
                 return auth;
               }
+              function buildModeSelectHTML(webviewuuid, currentMode) {
+                var normalized = (currentMode || 'flow').toLowerCase();
+                var options = ['flow','fixed','random'].map(function(mode) {
+                  var selected = mode === normalized ? ' selected' : '';
+                  return '<option value="' + mode + '"' + selected + '>' + mode + '</option>';
+                }).join('');
+                return '<label class="mode-picker">mode <select class="mode-select" data-uuid="' + webviewuuid + '">' + options + '</select></label>';
+              }
               function formatDateDisplay(iso) {
                 var d = new Date(iso);
                 if (isNaN(d.getTime())) return iso;
@@ -414,8 +514,58 @@ const server = http.createServer((req, res) => {
                     container.innerHTML = webviews.map(function(w) {
                       var y = (w.rows || 10) * (w.columns || 10);
                       var deleteBtn = w.webviewuuid === 'testuuid' ? '' : '<button type="button" class="delete-btn" aria-label="Delete" data-uuid="' + w.webviewuuid + '"><img src="/trash-bin.png" alt="Delete" /></button>';
-                      return '<div class="webview-item"><div class="webview-info"><a href="/' + w.webviewuuid + '" class="webview-link"><span>' + w.webviewuuid + '</span></a> <span class="webview-count">(' + (w.uuidCount || 0) + '/' + y + ')</span><small>' + formatDateDisplay(w.created_at) + '</small></div>' + deleteBtn + '</div>';
+                      var modeSelector = buildModeSelectHTML(w.webviewuuid, w.display_mode);
+                      return '<div class="webview-item"><div class="webview-info"><a href="/' + w.webviewuuid + '" class="webview-link"><span>' + w.webviewuuid + '</span></a> <span class="webview-count">(' + (w.uuidCount || 0) + '/' + y + ')</span><small>' + formatDateDisplay(w.created_at) + '</small></div><div class="webview-actions">' + modeSelector + deleteBtn + '</div></div>';
                     }).join('');
+                  });
+              }
+              function updateDisplayMode(webviewuuid, mode, selectEl) {
+                const auth = getAuthHeader();
+                if (!auth) {
+                  alert('Authorization required.');
+                  return;
+                }
+                if (!webviewuuid) {
+                  return;
+                }
+                const allowed = ['flow','fixed','random'];
+                if (allowed.indexOf(mode) === -1) {
+                  alert('Invalid mode.');
+                  return;
+                }
+                if (selectEl) {
+                  selectEl.disabled = true;
+                }
+                fetch('/webviews/' + encodeURIComponent(webviewuuid) + '/display-mode', {
+                  method: 'POST',
+                  headers: {
+                    Authorization: auth,
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({ displayMode: mode })
+                })
+                  .then(r => {
+                    if (r.status === 401) {
+                      sessionStorage.removeItem('auth');
+                      alert('Session expired. Please try again.');
+                      return {};
+                    }
+                    return r.json();
+                  })
+                  .then(data => {
+                    if (data && data.error) {
+                      alert('Update failed: ' + data.error);
+                      refreshWebviews();
+                    }
+                  })
+                  .catch(err => {
+                    alert('Update failed: ' + err.message);
+                    refreshWebviews();
+                  })
+                  .finally(() => {
+                    if (selectEl) {
+                      selectEl.disabled = false;
+                    }
                   });
               }
               function createWebview() {
@@ -493,6 +643,11 @@ const server = http.createServer((req, res) => {
                 const btn = event.target.closest('.delete-btn');
                 if (!btn || !btn.dataset.uuid) return;
                 deleteWebview(btn.dataset.uuid, btn);
+              });
+              document.getElementById('webviews').addEventListener('change', function(event) {
+                const select = event.target.closest('.mode-select');
+                if (!select || !select.dataset.uuid) return;
+                updateDisplayMode(select.dataset.uuid, select.value.toLowerCase(), select);
               });
             </script>
           </body>
@@ -735,7 +890,7 @@ const server = http.createServer((req, res) => {
   } else if (/^\/[a-zA-Z0-9]{8}$/.test(req.url)) {
     // Serve the grid page at /:uuid and expose uuid to frontend
     const uuid = req.url.slice(1);
-    sharedDb.get('SELECT rows, columns, width, height FROM webviews WHERE webviewuuid = ?', [uuid], (err, row) => {
+    sharedDb.get('SELECT rows, columns, width, height, display_mode FROM webviews WHERE webviewuuid = ?', [uuid], (err, row) => {
       if (err || !row) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Webview not found');
@@ -747,7 +902,8 @@ const server = http.createServer((req, res) => {
           res.end("Error loading index.html");
         } else {
           // Inject a script to expose uuid, rows, columns, width, height
-          const injected = data.replace('<body>', `<body><script>window.uuid = '${uuid}'; window.gridRows = ${row.rows || 10}; window.gridCols = ${row.columns || 10}; window.gridWidth = ${row.width || 100}; window.gridHeight = ${row.height || 100};</script>`);
+          const mode = row.display_mode || 'flow';
+          const injected = data.replace('<body>', `<body><script>window.uuid = '${uuid}'; window.gridRows = ${row.rows || 10}; window.gridCols = ${row.columns || 10}; window.gridWidth = ${row.width || 100}; window.gridHeight = ${row.height || 100}; window.displayMode = '${mode}';</script>`);
           res.writeHead(200, { "Content-Type": "text/html" });
           res.end(injected);
         }

@@ -688,6 +688,72 @@
     let gridRows = rows;
     let gridCols = cols;
     let uuidMeta = [];
+    let slotAssignments = [];
+    const allowedDisplayModes = new Set(['flow', 'fixed', 'random']);
+    const displayModeRaw = typeof window.displayMode === 'string' ? window.displayMode.toLowerCase() : 'flow';
+    const displayMode = allowedDisplayModes.has(displayModeRaw) ? displayModeRaw : 'flow';
+
+    function normalizeUuidEntry(entry) {
+      if (!entry) {
+        return null;
+      }
+      if (typeof entry === 'string') {
+        return { uuid: entry, link_index: null };
+      }
+      if (typeof entry === 'object') {
+        const uuid = typeof entry.uuid === 'string' ? entry.uuid : '';
+        if (!uuid) {
+          return null;
+        }
+        const rawIndex = entry.link_index;
+        const parsedIndex = typeof rawIndex === 'number' && Number.isFinite(rawIndex)
+          ? rawIndex
+          : (typeof rawIndex === 'string' ? parseInt(rawIndex, 10) : null);
+        const link_index = Number.isFinite(parsedIndex) ? parsedIndex : null;
+        return { uuid, link_index };
+      }
+      return null;
+    }
+
+    function buildSlotAssignments(rawEntries) {
+      const totalSlots = gridRows * gridCols;
+      const normalized = Array.isArray(rawEntries)
+        ? rawEntries.map(normalizeUuidEntry).filter(Boolean)
+        : [];
+      const slots = new Array(totalSlots).fill(null);
+      if (!totalSlots || !normalized.length) {
+        return slots;
+      }
+      if (displayMode === 'fixed') {
+        normalized.forEach((entry) => {
+          const idx = Number.isFinite(entry.link_index) ? entry.link_index - 1 : null;
+          if (idx !== null && idx >= 0 && idx < totalSlots) {
+            slots[idx] = entry;
+          }
+        });
+        return slots;
+      }
+      if (displayMode === 'random') {
+        const slotIndices = Array.from({ length: totalSlots }, (_, i) => i);
+        for (let i = slotIndices.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          const tmp = slotIndices[i];
+          slotIndices[i] = slotIndices[j];
+          slotIndices[j] = tmp;
+        }
+        normalized.slice(0, totalSlots).forEach((entry, idx) => {
+          const targetSlot = slotIndices[idx];
+          if (typeof targetSlot === 'number') {
+            slots[targetSlot] = entry;
+          }
+        });
+        return slots;
+      }
+      normalized.slice(0, totalSlots).forEach((entry, idx) => {
+        slots[idx] = entry;
+      });
+      return slots;
+    }
 
     async function createGrid() {
       // Fetch UUIDs for this webview
@@ -698,6 +764,7 @@
           uuidMeta = Array.isArray(data) ? data : [];
         }
       } catch (e) {}
+      slotAssignments = buildSlotAssignments(uuidMeta);
 
       let counter = 0;
       for (let y = 0; y < gridRows; y++) {
@@ -711,7 +778,7 @@
           container.className = 'p5canvas';
           outer.appendChild(container);
           gridContainers.push(container);
-          const assignedEntry = uuidMeta[counter];
+          const assignedEntry = Array.isArray(slotAssignments) ? slotAssignments[counter] : null;
           let assignedUUID = '';
           let assignedIndex = null;
           if (assignedEntry && typeof assignedEntry === 'object') {

@@ -1,6 +1,6 @@
 function getAllWebviews() {
     return new Promise((resolve, reject) => {
-        db.all('SELECT webviewuuid, rows, columns, width, height, created_at FROM webviews ORDER BY created_at DESC', [], (err, rows) => {
+        db.all('SELECT webviewuuid, rows, columns, width, height, created_at, display_mode FROM webviews ORDER BY created_at DESC', [], (err, rows) => {
             if (err) reject(err);
             else resolve(rows);
         });
@@ -13,7 +13,7 @@ const dbPath = path.join(__dirname, 'uuids.db');
 const db = new sqlite3.Database(dbPath);
 
 db.serialize(() => {
-    db.run('CREATE TABLE IF NOT EXISTS webviews (id INTEGER PRIMARY KEY AUTOINCREMENT, webviewuuid TEXT UNIQUE NOT NULL, rows INTEGER DEFAULT 10, columns INTEGER DEFAULT 10, width INTEGER DEFAULT 100, height INTEGER DEFAULT 100, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
+    db.run('CREATE TABLE IF NOT EXISTS webviews (id INTEGER PRIMARY KEY AUTOINCREMENT, webviewuuid TEXT UNIQUE NOT NULL, rows INTEGER DEFAULT 10, columns INTEGER DEFAULT 10, width INTEGER DEFAULT 100, height INTEGER DEFAULT 100, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, display_mode TEXT DEFAULT "flow")');
     // Ensure new columns exist for older installations
     const ensureColumn = (name, sql) => {
         db.run(sql, err => {
@@ -26,6 +26,12 @@ db.serialize(() => {
     ensureColumn('columns', 'ALTER TABLE webviews ADD COLUMN columns INTEGER DEFAULT 10');
     ensureColumn('width', 'ALTER TABLE webviews ADD COLUMN width INTEGER DEFAULT 100');
     ensureColumn('height', 'ALTER TABLE webviews ADD COLUMN height INTEGER DEFAULT 100');
+    ensureColumn('display_mode', 'ALTER TABLE webviews ADD COLUMN display_mode TEXT DEFAULT "flow"');
+    db.run('UPDATE webviews SET display_mode = "flow" WHERE display_mode IS NULL', (err) => {
+        if (err && !/no such column/i.test(err.message)) {
+            console.warn('Could not backfill display_mode:', err.message);
+        }
+    });
     db.run('CREATE TABLE IF NOT EXISTS uuids (id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT NOT NULL, webviewuuid TEXT, email TEXT, link_index INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
     // Ensure email column exists for older databases
     db.run('ALTER TABLE uuids ADD COLUMN email TEXT', (err) => {
