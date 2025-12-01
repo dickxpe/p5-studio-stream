@@ -17,6 +17,7 @@ const TILE_SIZE = 8;
 const MAX_TILE_RATIO = 0.6; // Fall back to full frame if >60% pixels change
 const MAX_TILE_COUNT = 200; // Or if too many tiles would be sent
 const PIXEL_POOL_MAX_BUCKET = 24;
+const textEncoder = new TextEncoder();
 
 class Uint8ClampedArrayPool {
     constructor(maxPerBucket = PIXEL_POOL_MAX_BUCKET) {
@@ -57,29 +58,29 @@ const pixelPool = new Uint8ClampedArrayPool();
 
 async function refreshUUIDs() {
     try {
-        const resp = await fetch(`/uuids/${TARGET_WEBVIEWUUID}`);
+        const resp = await fetch("/uuids/" + TARGET_WEBVIEWUUID);
         if (!resp.ok) {
-            throw new Error(`Unexpected status ${resp.status}`);
+            throw new Error("Unexpected status " + resp.status);
         }
         const data = await resp.json();
         if (Array.isArray(data) && data.length > 0) {
             targetUUIDs = data.map((value) => String(value));
-            console.log(`[Sender] Loaded ${targetUUIDs.length} UUIDs from server`);
+            console.log("[Sender] Loaded " + targetUUIDs.length + " UUIDs from server");
             return;
         }
-        console.warn('[Sender] UUID response empty, falling back to defaults');
+        console.warn("[Sender] UUID response empty, falling back to defaults");
     } catch (err) {
-        console.warn('[Sender] Failed to load UUIDs, using defaults', err);
+        console.warn("[Sender] Failed to load UUIDs, using defaults", err);
     }
     targetUUIDs = [...DEFAULT_UUIDS];
 }
 
 const myShape = {
-    x: 100,
+    x: 50,
     y: 50,
     w: 50,
     h: 50,
-    c: 250
+    c: 0
 };
 
 function connectWS() {
@@ -118,8 +119,9 @@ function scheduleReconnect() {
 
 function setup() {
     pixelDensity(1);
-    createCanvas(200, 200);
-    background(255);
+    createCanvas(100, 100);
+    colorMode(HSB, 360, 100, 100);
+    background(0, 100, 100);
     refreshUUIDs().finally(connectWS);
 
     p5.tween.manager.addTween(myShape, 'tween1')
@@ -141,17 +143,15 @@ function setup() {
             { key: 'h', target: 50 },
             { key: 'y', target: 100 }
         ], 500, 'easeOutQuad')
-        .onLoop((tween) => myShape.c = random(0, 255))
+        .onLoop((tween) => myShape.c = random(0, 360))
         .startLoop();
 }
 
 function draw() {
-    if (frameCount % 2 === 0) {
-        background(250);
-        noStroke();
-        fill(myShape.c, 125, 125);
-        ellipse(myShape.x, myShape.y, myShape.w, myShape.h);
-    }
+    background(frameCount % 360);
+    noStroke();
+    fill(myShape.c, 125, 125);
+    ellipse(myShape.x, myShape.y, myShape.w, myShape.h);
     sendPixelsIfNeeded();
 
 }
@@ -211,20 +211,21 @@ function isSocketOpen() {
 }
 
 function sendPayloadToAll(pixelsArray, region, isFullFrame) {
-    const serializedPixels = Array.from(pixelsArray);
-    const basePayload = {
+    const typedPixels = toUint8ArrayView(pixelsArray);
+    const header = {
         webviewuuid: TARGET_WEBVIEWUUID,
         senderId,
         uuids: targetUUIDs.slice(),
-        pixels: serializedPixels,
         isFullFrame,
         fullWidth: width,
-        fullHeight: height
+        fullHeight: height,
+        pixelLength: typedPixels.byteLength
     };
     if (region) {
-        basePayload.region = region;
+        header.region = region;
     }
-    ws.send(JSON.stringify(basePayload));
+    const frame = buildBinaryFrame(header, typedPixels);
+    ws.send(frame);
 }
 
 function extractDirtyTiles(current, previous, canvasWidth, canvasHeight) {
@@ -304,4 +305,39 @@ function releaseDiffTiles(diff) {
             pixelPool.release(tile.pixels);
         }
     });
+}
+
+function toUint8ArrayView(source) {
+    if (source instanceof Uint8Array) {
+        return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    }
+    if (source instanceof Uint8ClampedArray) {
+        return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    }
+    if (Array.isArray(source)) {
+        return Uint8Array.from(source);
+    }
+    if (source && typeof source.buffer === 'object') {
+        try {
+            return new Uint8Array(source.buffer, source.byteOffset || 0, source.byteLength || source.length || 0);
+        } catch (err) {
+            return new Uint8Array(0);
+        }
+    }
+    return new Uint8Array(0);
+}
+
+function buildBinaryFrame(metadata, pixelArray) {
+    const headerBytes = textEncoder.encode(JSON.stringify(metadata));
+    const totalBytes = 4 + headerBytes.length + pixelArray.byteLength;
+    const buffer = new ArrayBuffer(totalBytes);
+    const view = new DataView(buffer);
+    view.setUint32(0, headerBytes.length, false);
+    const headerDest = new Uint8Array(buffer, 4, headerBytes.length);
+    headerDest.set(headerBytes);
+    if (pixelArray.byteLength) {
+        const pixelDest = new Uint8Array(buffer, 4 + headerBytes.length, pixelArray.byteLength);
+        pixelDest.set(pixelArray);
+    }
+    return buffer;
 }

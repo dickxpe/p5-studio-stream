@@ -6,22 +6,45 @@ const sqlite3 = require('sqlite3').verbose();
 const { URLSearchParams } = require('url');
 let uuidv4;
 const { saveUUID } = require("./db");
+const dbPath = path.join(__dirname, 'uuids.db');
+const sharedDb = new sqlite3.Database(dbPath);
+let shuttingDown = false;
+const staticFileCache = new Map();
+const STATIC_CACHE_MAX_AGE_SECONDS = 3600;
+const gracefulClose = () => {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  sharedDb.close(() => {
+    process.exit(0);
+  });
+};
+process.once('SIGINT', gracefulClose);
+process.once('SIGTERM', gracefulClose);
+process.once('exit', () => {
+  if (shuttingDown) {
+    return;
+  }
+  try {
+    sharedDb.close();
+  } catch (err) {
+    // ignore close errors during exit
+  }
+});
 
 
 const server = http.createServer((req, res) => {
   // Endpoint to get all uuids for a webviewuuid, ordered by insertion
   if (/^\/uuids\/[a-zA-Z0-9]{8}$/.test(req.url)) {
     const webviewuuid = req.url.split("/uuids/")[1];
-    const dbPath = require('path').join(__dirname, 'uuids.db');
-    const db = new sqlite3.Database(dbPath);
-    db.all('SELECT uuid FROM uuids WHERE webviewuuid = ? ORDER BY id ASC', [webviewuuid], (err, rows) => {
-      db.close();
+    sharedDb.all('SELECT uuid, link_index FROM uuids WHERE webviewuuid = ? ORDER BY id ASC', [webviewuuid], (err, rows) => {
       if (err) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       } else {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(rows.map(r => r.uuid)));
+        res.end(JSON.stringify(rows));
       }
     });
     return;
@@ -30,6 +53,28 @@ const server = http.createServer((req, res) => {
 
 
 
+
+  // DELETE a specific UUID from a webview
+  if (/^\/uuids\/[a-zA-Z0-9]{8}\/[a-zA-Z0-9]+$/.test(req.url) && req.method === 'DELETE') {
+    const parts = req.url.split('/');
+    const webviewuuid = parts[2];
+    const targetUuid = decodeURIComponent(parts[3] || '');
+    sharedDb.run('DELETE FROM uuids WHERE webviewuuid = ? AND uuid = ?', [webviewuuid, targetUuid], function (err) {
+      if (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+      if (this.changes === 0) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'UUID not found' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+    });
+    return;
+  }
 
   // Temporary endpoint to create admin user
   if (req.url === "/create-admin") {
@@ -91,17 +136,12 @@ const server = http.createServer((req, res) => {
         ).join("");
         const created_at = new Date().toISOString();
         // Insert new webview into webviews table
-        const sqlite3 = require('sqlite3').verbose();
-        const dbPath = require('path').join(__dirname, 'uuids.db');
-        const db = new sqlite3.Database(dbPath);
-        db.run('INSERT INTO webviews (webviewuuid, rows, columns, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?)', [webviewuuid, rows, columns, width, height, created_at], function (err) {
+        sharedDb.run('INSERT INTO webviews (webviewuuid, rows, columns, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?)', [webviewuuid, rows, columns, width, height, created_at], function (err) {
           if (err) {
             res.writeHead(500, { 'Content-Type': 'text/plain' });
             res.end('DB error: ' + err.message);
-            db.close();
             return;
           }
-          db.close();
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ uuid: webviewuuid, rows, columns, width, height, created_at }));
         });
@@ -131,19 +171,14 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: 'Invalid webviewuuid' }));
         return;
       }
-      const sqlite3 = require('sqlite3').verbose();
-      const dbPath = require('path').join(__dirname, 'uuids.db');
-      const db = new sqlite3.Database(dbPath);
-      db.serialize(() => {
-        db.run('DELETE FROM uuids WHERE webviewuuid = ?', [webviewuuid], function (err1) {
+      sharedDb.serialize(() => {
+        sharedDb.run('DELETE FROM uuids WHERE webviewuuid = ?', [webviewuuid], function (err1) {
           if (err1) {
-            db.close();
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: err1.message }));
             return;
           }
-          db.run('DELETE FROM webviews WHERE webviewuuid = ?', [webviewuuid], function (err2) {
-            db.close();
+          sharedDb.run('DELETE FROM webviews WHERE webviewuuid = ?', [webviewuuid], function (err2) {
             if (err2) {
               res.writeHead(500, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: err2.message }));
@@ -176,16 +211,12 @@ const server = http.createServer((req, res) => {
       }
       getAllWebviews().then(webviews => {
         // For each webview, count linked uuids
-        const sqlite3 = require('sqlite3').verbose();
-        const dbPath = require('path').join(__dirname, 'uuids.db');
-        const db = new sqlite3.Database(dbPath);
         const getCounts = (webviews) => Promise.all(webviews.map(w => new Promise((resolve) => {
-          db.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [w.webviewuuid], (err, row) => {
+          sharedDb.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [w.webviewuuid], (err, row) => {
             resolve({ ...w, uuidCount: row ? row.count : 0 });
           });
         })));
         getCounts(webviews).then(webviewsWithCounts => {
-          db.close();
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(webviewsWithCounts));
         });
@@ -218,16 +249,12 @@ const server = http.createServer((req, res) => {
       }
       getAllWebviews().then(webviews => {
         // For each webview, count linked uuids
-        const sqlite3 = require('sqlite3').verbose();
-        const dbPath = require('path').join(__dirname, 'uuids.db');
-        const db = new sqlite3.Database(dbPath);
         const getCounts = (webviews) => Promise.all(webviews.map(w => new Promise((resolve) => {
-          db.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [w.webviewuuid], (err, row) => {
+          sharedDb.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [w.webviewuuid], (err, row) => {
             resolve({ ...w, uuidCount: row ? row.count : 0 });
           });
         })));
         getCounts(webviews).then(webviewsWithCounts => {
-          db.close();
           const formatDate = (iso) => {
             const d = new Date(iso);
             if (isNaN(d.getTime())) return iso;
@@ -522,32 +549,32 @@ const server = http.createServer((req, res) => {
       Math.random().toString(36).charAt(2)
     ).join("");
     // Save uuid with reference to webviewuuid, add counter, and check for full webview
-    const sqlite3 = require('sqlite3').verbose();
-    const dbPath = require('path').join(__dirname, 'uuids.db');
-    const db = new sqlite3.Database(dbPath);
-    db.get('SELECT rows, columns FROM webviews WHERE webviewuuid = ?', [webviewuuid], (err, webview) => {
+    sharedDb.get('SELECT rows, columns FROM webviews WHERE webviewuuid = ?', [webviewuuid], (err, webview) => {
       if (err || !webview) {
-        db.close();
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         res.end('Invalid webviewuuid');
         return;
       }
-      db.run('INSERT INTO uuids (uuid, webviewuuid, email) VALUES (?, ?, ?)', [uuid, webviewuuid, email || null], function (err3) {
-        if (err3) {
-          db.close();
-          res.writeHead(500, { 'Content-Type': 'text/plain' });
-          res.end('DB error: ' + err3.message);
-          return;
-        }
-        // Now count how many uuids are linked (including the one just added)
-        db.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [webviewuuid], (err2, row) => {
-          db.close();
-          if (err2) {
-            res.writeHead(500, { 'Content-Type': 'text/plain' });
-            res.end('DB error: ' + err2.message);
-            return;
-          }
-          const displayCounter = row ? row.count : 1;
+      getNextLinkIndexShared(webviewuuid)
+        .then((nextIndex) => new Promise((resolve, reject) => {
+          sharedDb.run('INSERT INTO uuids (uuid, webviewuuid, email, link_index) VALUES (?, ?, ?, ?)', [uuid, webviewuuid, email || null, nextIndex], function (err3) {
+            if (err3) {
+              reject(err3);
+            } else {
+              resolve();
+            }
+          });
+        }))
+        .then(() => new Promise((resolve, reject) => {
+          sharedDb.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [webviewuuid], (err2, row) => {
+            if (err2) {
+              reject(err2);
+              return;
+            }
+            resolve(row ? row.count : 1);
+          });
+        }))
+        .then((displayCounter) => {
           const max = (webview.rows || 10) * (webview.columns || 10);
           let fullMsg = '';
           if (displayCounter > max) {
@@ -588,8 +615,11 @@ const server = http.createServer((req, res) => {
             </html>`;
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end(renderPage());
+        })
+        .catch((errInsert) => {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('DB error: ' + errInsert.message);
         });
-      });
     });
   } else if (req.url === "/" || req.url === "/index.html") {
     // Show a welcome page with input for webviewuuid
@@ -678,24 +708,18 @@ const server = http.createServer((req, res) => {
   } else if (req.url.startsWith("/check-webviewuuid/")) {
     // AJAX endpoint to check if a webviewuuid exists and whether it's full
     const uuid = decodeURIComponent(req.url.split("/check-webviewuuid/")[1] || "");
-    const sqlite3 = require('sqlite3').verbose();
-    const dbPath = require('path').join(__dirname, 'uuids.db');
-    const db = new sqlite3.Database(dbPath);
-    db.get('SELECT rows, columns FROM webviews WHERE webviewuuid = ?', [uuid], (err, webview) => {
+    sharedDb.get('SELECT rows, columns FROM webviews WHERE webviewuuid = ?', [uuid], (err, webview) => {
       if (err) {
-        db.close();
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
         return;
       }
       if (!webview) {
-        db.close();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ exists: false }));
         return;
       }
-      db.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [uuid], (countErr, row) => {
-        db.close();
+      sharedDb.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [uuid], (countErr, row) => {
         if (countErr) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: countErr.message }));
@@ -711,10 +735,7 @@ const server = http.createServer((req, res) => {
   } else if (/^\/[a-zA-Z0-9]{8}$/.test(req.url)) {
     // Serve the grid page at /:uuid and expose uuid to frontend
     const uuid = req.url.slice(1);
-    const dbPath = require('path').join(__dirname, 'uuids.db');
-    const db = new sqlite3.Database(dbPath);
-    db.get('SELECT rows, columns, width, height FROM webviews WHERE webviewuuid = ?', [uuid], (err, row) => {
-      db.close();
+    sharedDb.get('SELECT rows, columns, width, height FROM webviews WHERE webviewuuid = ?', [uuid], (err, row) => {
       if (err || !row) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Webview not found');
@@ -734,20 +755,7 @@ const server = http.createServer((req, res) => {
     });
   } else if (req.url.startsWith("/p5/")) {
     const filePath = path.join(__dirname, req.url);
-    fs.readFile(filePath, (err, data) => {
-      if (err) {
-        res.writeHead(404, { "Content-Type": "text/plain" });
-        res.end("File not found: " + req.url);
-      } else {
-        // Set content type based on file extension
-        let contentType = "application/octet-stream";
-        if (filePath.endsWith(".js")) contentType = "application/javascript";
-        else if (filePath.endsWith(".css")) contentType = "text/css";
-        else if (filePath.endsWith(".html")) contentType = "text/html";
-        res.writeHead(200, { "Content-Type": contentType });
-        res.end(data);
-      }
-    });
+    serveStaticFile(req, res, filePath);
   } else if (req.url === "/trash-bin.png") {
     const filePath = path.join(__dirname, "trash-bin.png");
     fs.readFile(filePath, (err, data) => {
@@ -769,3 +777,62 @@ const port = process.env.PORT || 3000;
 server.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
+function serveStaticFile(req, res, filePath) {
+  fs.stat(filePath, (statErr, stats) => {
+    if (statErr || !stats.isFile()) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('File not found: ' + req.url);
+      return;
+    }
+    const cached = staticFileCache.get(filePath);
+    if (cached && cached.mtimeMs === stats.mtimeMs) {
+      sendStaticResponse(res, cached.data, filePath);
+      return;
+    }
+    fs.readFile(filePath, (err, data) => {
+      if (err) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Failed to read file');
+        return;
+      }
+      staticFileCache.set(filePath, { data, mtimeMs: stats.mtimeMs });
+      sendStaticResponse(res, data, filePath);
+    });
+  });
+}
+
+function sendStaticResponse(res, data, filePath) {
+  res.writeHead(200, {
+    'Content-Type': detectContentType(filePath),
+    'Content-Length': data.length,
+    'Cache-Control': `public, max-age=${STATIC_CACHE_MAX_AGE_SECONDS}`
+  });
+  res.end(data);
+}
+
+function detectContentType(filePath) {
+  if (filePath.endsWith('.js')) return 'application/javascript';
+  if (filePath.endsWith('.css')) return 'text/css';
+  if (filePath.endsWith('.html')) return 'text/html';
+  if (filePath.endsWith('.png')) return 'image/png';
+  if (filePath.endsWith('.svg')) return 'image/svg+xml';
+  return 'application/octet-stream';
+}
+
+function getNextLinkIndexShared(webviewuuid) {
+  return new Promise((resolve, reject) => {
+    if (!webviewuuid) {
+      resolve(null);
+      return;
+    }
+    sharedDb.get('SELECT MAX(link_index) as maxIndex, COUNT(*) as total FROM uuids WHERE webviewuuid = ?', [webviewuuid], (err, row) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      const base = row && row.maxIndex ? row.maxIndex : (row ? row.total : 0);
+      resolve(base + 1);
+    });
+  });
+}

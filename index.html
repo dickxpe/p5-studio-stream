@@ -42,7 +42,7 @@
       font-size: 14px;
       color: #333;
       background: rgba(110, 110, 110, 0.171);
-      pointer-events: none;
+      pointer-events: auto;
       z-index: 10;
       padding: 0;
       border-radius: 6px;
@@ -53,9 +53,43 @@
       line-height: 1;
       white-space: normal;
       height: 90%;
+      opacity: 1;
+      transition: opacity 0.2s ease-in-out;
     }
     .canvas-label span + span {
       margin-top: 4px;
+    }
+    .p5canvas-outer[data-loaded="true"] .canvas-label {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .p5canvas-outer[data-loaded="true"]:hover .canvas-label {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .canvas-label .unlink-button {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 20px;
+      height: 20px;
+      border: none;
+      background: rgba(255, 0, 0, 0.85);
+      color: #fff;
+      border-radius: 50%;
+      font-size: 14px;
+      line-height: 18px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      pointer-events: auto;
+      transition: transform 0.15s ease-in-out, background 0.15s ease-in-out;
+    }
+    .canvas-label .unlink-button:hover {
+      background: rgba(200, 0, 0, 0.95);
+      transform: scale(1.05);
     }
 
     .p5canvas {
@@ -310,7 +344,7 @@
         this.bufferPool = bufferPool;
       }
 
-      registerCanvas(uuid, canvasElement, labelElement) {
+      registerCanvas(uuid, canvasElement, labelElement, outerElement) {
         const ctx = canvasElement.getContext('2d');
         if (ctx) {
           ctx.imageSmoothingEnabled = false;
@@ -319,6 +353,8 @@
           canvas: canvasElement,
           ctx,
           label: labelElement,
+          outer: outerElement,
+          hasLoaded: false,
           queue: []
         });
       }
@@ -328,9 +364,11 @@
         if (!entry || !payload) {
           return;
         }
-        if (entry.label) {
-          entry.label.style.display = 'none';
-          entry.label = null;
+        if (!entry.hasLoaded) {
+          entry.hasLoaded = true;
+          if (entry.outer) {
+            entry.outer.dataset.loaded = 'true';
+          }
         }
         this.applyBackpressure(entry, payload);
         entry.queue.push(payload);
@@ -499,9 +537,9 @@
         this.fallback = new CanvasRenderManager(bufferPool);
       }
 
-      registerCanvas(uuid, canvasElement, labelElement) {
+      registerCanvas(uuid, canvasElement, labelElement, outerElement) {
         if (typeof canvasElement.transferControlToOffscreen !== 'function') {
-          this.fallback.registerCanvas(uuid, canvasElement, labelElement);
+          this.fallback.registerCanvas(uuid, canvasElement, labelElement, outerElement);
           this.entries.set(uuid, { fallback: true });
           return;
         }
@@ -520,7 +558,7 @@
         } catch (err) {
           console.warn('[OffscreenRenderer] transferControlToOffscreen failed', err);
           worker.terminate();
-          this.fallback.registerCanvas(uuid, canvasElement, labelElement);
+          this.fallback.registerCanvas(uuid, canvasElement, labelElement, outerElement);
           this.entries.set(uuid, { fallback: true });
           return;
         }
@@ -534,9 +572,11 @@
         this.entries.set(uuid, {
           worker,
           label: labelElement,
+          outer: outerElement,
           canvasWidth: canvasElement.width,
           canvasHeight: canvasElement.height,
-          fallback: false
+          fallback: false,
+          hasLoaded: false
         });
       }
 
@@ -549,9 +589,11 @@
           this.fallback.enqueue(uuid, payload);
           return;
         }
-        if (entry.label) {
-          entry.label.style.display = 'none';
-          entry.label = null;
+        if (!entry.hasLoaded) {
+          entry.hasLoaded = true;
+          if (entry.outer) {
+            entry.outer.dataset.loaded = 'true';
+          }
         }
         const { message, transferables } = this.buildFrameMessage(payload, entry);
         entry.worker.postMessage(message, transferables);
@@ -645,14 +687,15 @@
     let gridPlaceholders = [];
     let gridRows = rows;
     let gridCols = cols;
-    let uuids = [];
+    let uuidMeta = [];
 
     async function createGrid() {
       // Fetch UUIDs for this webview
       try {
         const uuidResp = await fetch(`/uuids/${window.uuid}`);
         if (uuidResp.ok) {
-          uuids = await uuidResp.json();
+          const data = await uuidResp.json();
+          uuidMeta = Array.isArray(data) ? data : [];
         }
       } catch (e) {}
 
@@ -668,12 +711,33 @@
           container.className = 'p5canvas';
           outer.appendChild(container);
           gridContainers.push(container);
-          const assignedUUID = uuids[counter] || '';
+          const assignedEntry = uuidMeta[counter];
+          let assignedUUID = '';
+          let assignedIndex = null;
+          if (assignedEntry && typeof assignedEntry === 'object') {
+            assignedUUID = typeof assignedEntry.uuid === 'string' ? assignedEntry.uuid : '';
+            assignedIndex = Number.isFinite(assignedEntry.link_index) ? assignedEntry.link_index : null;
+          } else if (typeof assignedEntry === 'string') {
+            assignedUUID = assignedEntry;
+          }
           const thisCounter = counter; // capture for closure
           if (assignedUUID) {
             const label = document.createElement('div');
             label.className = 'canvas-label';
-            label.innerHTML = `<span class="canvas-label-counter">${thisCounter}</span><span class="canvas-label-ready">ready</span><span class="canvas-label-uuid">${assignedUUID}</span>`;
+            label.dataset.uuid = assignedUUID;
+            const indexLabel = Number.isFinite(assignedIndex) ? assignedIndex : '';
+            label.innerHTML = `<span class="canvas-label-counter">${indexLabel}</span><span class="canvas-label-ready">ready</span><span class="canvas-label-uuid">${assignedUUID}</span>`;
+            const unlinkBtn = document.createElement('button');
+            unlinkBtn.type = 'button';
+            unlinkBtn.className = 'unlink-button';
+            unlinkBtn.textContent = '✕';
+            unlinkBtn.title = 'Unlink this canvas';
+            unlinkBtn.addEventListener('click', (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              unlinkCanvas(assignedUUID);
+            });
+            label.appendChild(unlinkBtn);
             outer.insertBefore(label, container);
 
             const canvasEl = document.createElement('canvas');
@@ -689,7 +753,7 @@
             container.appendChild(canvasEl);
             gridCanvases.push(canvasEl);
 
-            canvasRenderer.registerCanvas(assignedUUID, canvasEl, label);
+            canvasRenderer.registerCanvas(assignedUUID, canvasEl, label, outer);
             sharedDisplaySocket.register(assignedUUID, (payload) => {
               canvasRenderer.enqueue(assignedUUID, payload);
             });
@@ -851,6 +915,31 @@
     renderGrid();
     // Only rescale on resize
     window.addEventListener('resize', rescaleGrid);
+
+    async function unlinkCanvas(targetUuid) {
+      if (!targetUuid || !window.uuid) {
+        return;
+      }
+      const confirmUnlink = window.confirm(`Unlink canvas ${targetUuid}?`);
+      if (!confirmUnlink) {
+        return;
+      }
+      try {
+        const resp = await fetch(`/uuids/${window.uuid}/${targetUuid}`, {
+          method: 'DELETE'
+        });
+        if (resp.ok) {
+          window.location.reload();
+        } else {
+          const error = await resp.json().catch(() => ({}));
+          console.error('[Display] Failed to unlink canvas', error);
+          window.alert('Failed to unlink canvas.');
+        }
+      } catch (err) {
+        console.error('[Display] Unlink request failed', err);
+        window.alert('Network error unlinking canvas.');
+      }
+    }
   </script>
 </body>
 </html>

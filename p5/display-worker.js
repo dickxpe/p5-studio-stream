@@ -79,6 +79,10 @@ function enqueueFrame(payload) {
     coalescePending(payload);
     state.queue.push(payload);
     enforceQueueLimit();
+    scheduleFlush();
+}
+
+function scheduleFlush() {
     if (state.flushing) {
         return;
     }
@@ -90,17 +94,31 @@ function enqueueFrame(payload) {
     }
 }
 
-async function flushQueue() {
+function flushQueue() {
     state.rafHandle = null;
+    if (state.flushing) {
+        return;
+    }
     state.flushing = true;
+    drainQueue();
+}
+
+function drainQueue() {
     while (state.queue.length) {
         const payload = state.queue.shift();
-        await drawPayload(payload);
+        const maybePromise = drawPayload(payload);
+        if (maybePromise && typeof maybePromise.then === 'function') {
+            maybePromise.finally(() => {
+                state.flushing = false;
+                scheduleFlush();
+            });
+            return;
+        }
     }
     state.flushing = false;
 }
 
-async function drawPayload(payload) {
+function drawPayload(payload) {
     const ctx = state.ctx;
     if (!ctx || !payload) {
         return;
@@ -116,8 +134,7 @@ async function drawPayload(payload) {
     const isFullFrame = Boolean(payload.isFullFrame) || pixelArray.length === fullFramePixelCount;
 
     if (isFullFrame && typeof createImageBitmap === 'function' && typeof ctx.transferFromImageBitmap === 'function') {
-        await drawFullFrameViaBitmap(pixelArray, targetWidth, targetHeight, ctx);
-        return;
+        return drawFullFrameViaBitmap(pixelArray, targetWidth, targetHeight, ctx);
     }
     if (isFullFrame) {
         drawFullFrameViaPutImageData(pixelArray, targetWidth, targetHeight, ctx);

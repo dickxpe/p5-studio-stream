@@ -9,6 +9,11 @@ const db = new sqlite3.Database(dbPath);
 // Map: webviewuuid -> { uuid -> ws }
 // Map: webviewuuid -> { uuid -> { display: ws, senders: Set<ws> } }
 const canvasSockets = new Map();
+const displayBatchCache = new Map();
+const reusableUuidArrays = [];
+const UUID_ARRAY_POOL_LIMIT = 128;
+const webviewMetadataCache = new Map();
+const WEBVIEW_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const wss = new WebSocket.Server({
     port: 3001,
@@ -20,10 +25,13 @@ wss.on('connection', (ws) => {
     ws.senderRegistrations = new Set();
     console.log('[WS] New client connected');
 
-    ws.on('message', (message) => {
-        const msgStr = (typeof message === 'string') ? message : message.toString();
+    ws.on('message', async (message) => {
         try {
-            const data = JSON.parse(msgStr);
+            const data = parseIncomingMessage(message);
+            if (!data) {
+                console.log('[WS] Received unrecognized payload type');
+                return;
+            }
             if (!isValidPayload(data)) {
                 console.log('[WS] Message missing required fields:', data);
                 return;
@@ -56,15 +64,20 @@ wss.on('connection', (ws) => {
 
             const typedPixels = normalizePixels(data.pixels);
             const region = sanitizeRegion(data.region, typedPixels.length);
+            const webviewMeta = await getWebviewMetadata(webviewuuid);
+            if (!webviewMeta) {
+                console.log(`[${webviewuuid}] Skipping payload: metadata not found`);
+                return;
+            }
             const headerBase = {
                 region,
                 isFullFrame: !!data.isFullFrame,
-                fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : undefined,
-                fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined,
+                fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : webviewMeta.width,
+                fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : webviewMeta.height,
                 pixelLength: typedPixels.length
             };
 
-            const batchesByDisplay = new Map();
+            displayBatchCache.clear();
 
             targetUuids.forEach((uuid) => {
                 const entry = ensureEntry(webviewuuid, uuid);
@@ -76,10 +89,10 @@ wss.on('connection', (ws) => {
                 }
                 const displayWs = entry.display;
                 if (displayWs && displayWs.readyState === WebSocket.OPEN) {
-                    let batch = batchesByDisplay.get(displayWs);
+                    let batch = displayBatchCache.get(displayWs);
                     if (!batch) {
-                        batch = [];
-                        batchesByDisplay.set(displayWs, batch);
+                        batch = reusableUuidArrays.length ? reusableUuidArrays.pop() : [];
+                        displayBatchCache.set(displayWs, batch);
                     }
                     batch.push(uuid);
                 } else {
@@ -87,8 +100,9 @@ wss.on('connection', (ws) => {
                 }
             });
 
-            batchesByDisplay.forEach((uuidsForDisplay, displayWs) => {
+            displayBatchCache.forEach((uuidsForDisplay, displayWs) => {
                 if (!uuidsForDisplay.length) {
+                    releaseUuidArray(uuidsForDisplay);
                     return;
                 }
                 const header = {
@@ -98,7 +112,9 @@ wss.on('connection', (ws) => {
                 const frameBuffer = encodeBinaryFrame(header, typedPixels);
                 displayWs.send(frameBuffer, { binary: true, compress: false });
                 console.log(`[${webviewuuid}] Pixel data sent to display client for ${uuidsForDisplay.length} canvas(es) (${typedPixels.length} bytes${region ? ', region' : ', full frame'})`);
+                releaseUuidArray(uuidsForDisplay);
             });
+            displayBatchCache.clear();
         } catch (e) {
             console.error('[WS] Failed to parse message:', e);
             try {
@@ -145,12 +161,53 @@ function sanitizeRegion(region, pixelLength) {
 }
 
 function isValidPayload(data) {
-    if (!data || typeof data.webviewuuid !== 'string' || !Array.isArray(data.pixels)) {
+    const hasPixels = Array.isArray(data && data.pixels)
+        || data.pixels instanceof Uint8Array
+        || data.pixels instanceof Uint8ClampedArray
+        || Buffer.isBuffer(data && data.pixels);
+    if (!data || typeof data.webviewuuid !== 'string' || !hasPixels) {
         return false;
     }
     const hasSingle = typeof data.uuid === 'string' || typeof data.uuid === 'number';
     const hasBatch = Array.isArray(data.uuids) && data.uuids.length > 0;
     return hasSingle || hasBatch;
+}
+
+function parseIncomingMessage(message) {
+    if (typeof message === 'string') {
+        return JSON.parse(message);
+    }
+    if (Buffer.isBuffer(message)) {
+        const binary = decodeBinaryEnvelope(message);
+        if (binary) {
+            return binary;
+        }
+        try {
+            return JSON.parse(message.toString('utf8'));
+        } catch (err) {
+            return null;
+        }
+    }
+    if (message instanceof ArrayBuffer) {
+        const view = Buffer.from(message);
+        const binary = decodeBinaryEnvelope(view);
+        if (binary) {
+            return binary;
+        }
+        try {
+            return JSON.parse(Buffer.from(message).toString('utf8'));
+        } catch (err) {
+            return null;
+        }
+    }
+    if (message && typeof message.toString === 'function') {
+        try {
+            return JSON.parse(message.toString());
+        } catch (err) {
+            return null;
+        }
+    }
+    return null;
 }
 
 function normalizeUuid(value) {
@@ -201,6 +258,63 @@ function encodeBinaryFrame(header, pixelArray) {
         pixelBuf.copy(frame, 4 + headerBuf.length);
     }
     return frame;
+}
+
+function getWebviewMetadata(webviewuuid) {
+    const cached = webviewMetadataCache.get(webviewuuid);
+    const now = Date.now();
+    if (cached && (now - cached.timestamp) < WEBVIEW_CACHE_TTL_MS) {
+        return Promise.resolve(cached.value);
+    }
+    return new Promise((resolve) => {
+        db.get('SELECT rows, columns, width, height FROM webviews WHERE webviewuuid = ?', [webviewuuid], (err, row) => {
+            if (err || !row) {
+                webviewMetadataCache.delete(webviewuuid);
+                return resolve(null);
+            }
+            const value = {
+                rows: row.rows || 10,
+                columns: row.columns || 10,
+                width: row.width || 100,
+                height: row.height || 100
+            };
+            webviewMetadataCache.set(webviewuuid, { value, timestamp: Date.now() });
+            resolve(value);
+        });
+    });
+}
+
+function releaseUuidArray(arr) {
+    if (!arr) {
+        return;
+    }
+    arr.length = 0;
+    if (reusableUuidArrays.length < UUID_ARRAY_POOL_LIMIT) {
+        reusableUuidArrays.push(arr);
+    }
+}
+
+function decodeBinaryEnvelope(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length < 4) {
+        return null;
+    }
+    const headerLength = buffer.readUInt32BE(0);
+    const totalHeaderBytes = 4 + headerLength;
+    if (buffer.length < totalHeaderBytes) {
+        return null;
+    }
+    const headerJson = buffer.subarray(4, totalHeaderBytes).toString('utf8');
+    let metadata;
+    try {
+        metadata = JSON.parse(headerJson);
+    } catch (err) {
+        console.warn('[WS] Failed to parse binary sender header', err);
+        return null;
+    }
+    const pixelBytes = buffer.length - totalHeaderBytes;
+    const pixelSlice = pixelBytes > 0 ? buffer.subarray(totalHeaderBytes) : Buffer.alloc(0);
+    metadata.pixels = new Uint8Array(pixelSlice.buffer, pixelSlice.byteOffset, pixelSlice.byteLength);
+    return metadata;
 }
 
 function isDisplayHandshake(data) {
