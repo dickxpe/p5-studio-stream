@@ -1,5 +1,42 @@
 const FRAME_QUEUE_LIMIT = 8;
 
+class PixelBufferPool {
+    constructor(maxPerBucket = 32) {
+        this.maxPerBucket = maxPerBucket;
+        this.buckets = new Map();
+    }
+
+    acquire(length) {
+        if (!Number.isFinite(length) || length <= 0) {
+            return new Uint8ClampedArray(0);
+        }
+        const key = length;
+        const bucket = this.buckets.get(key);
+        if (bucket && bucket.length) {
+            return bucket.pop();
+        }
+        return new Uint8ClampedArray(length);
+    }
+
+    release(buffer) {
+        if (!(buffer instanceof Uint8ClampedArray)) {
+            return;
+        }
+        const length = buffer.length;
+        if (!length) {
+            return;
+        }
+        const bucket = this.buckets.get(length) || [];
+        if (bucket.length >= this.maxPerBucket) {
+            return;
+        }
+        bucket.push(buffer);
+        this.buckets.set(length, bucket);
+    }
+}
+
+const pixelPool = new PixelBufferPool();
+
 const state = {
     canvas: null,
     ctx: null,
@@ -199,8 +236,10 @@ function drawRegion(ctx, pixelArray, region, targetWidth, targetHeight) {
         return;
     }
     let payload = pixelArray;
+    let borrowed = false;
     if (srcOffsetX || srcOffsetY || copyWidth !== regionWidth || copyHeight !== regionHeight) {
-        payload = new Uint8ClampedArray(copyWidth * copyHeight * 4);
+        payload = pixelPool.acquire(copyWidth * copyHeight * 4);
+        borrowed = true;
         const srcStride = regionWidth * 4;
         for (let row = 0; row < copyHeight; row++) {
             const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
@@ -208,6 +247,12 @@ function drawRegion(ctx, pixelArray, region, targetWidth, targetHeight) {
             payload.set(pixelArray.subarray(srcIndex, srcIndex + copyWidth * 4), destIndex);
         }
     }
-    const imageData = new ImageData(payload, copyWidth, copyHeight);
-    ctx.putImageData(imageData, destX, destY);
+    try {
+        const imageData = new ImageData(payload, copyWidth, copyHeight);
+        ctx.putImageData(imageData, destX, destY);
+    } finally {
+        if (borrowed) {
+            pixelPool.release(payload);
+        }
+    }
 }

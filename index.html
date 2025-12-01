@@ -100,6 +100,44 @@
     const rows = typeof window.gridRows === 'number' ? window.gridRows : 10;
     const canvasesDiv = document.getElementById('canvases');
 
+    class PixelBufferPool {
+      constructor(maxPerBucket = 32) {
+        this.maxPerBucket = maxPerBucket;
+        this.buckets = new Map();
+      }
+
+      acquire(length) {
+        if (!Number.isFinite(length) || length <= 0) {
+          return new Uint8ClampedArray(0);
+        }
+        const key = length;
+        const bucket = this.buckets.get(key);
+        if (bucket && bucket.length) {
+          return bucket.pop();
+        }
+        return new Uint8ClampedArray(length);
+      }
+
+      release(buffer) {
+        if (!(buffer instanceof Uint8ClampedArray)) {
+          return;
+        }
+        const length = buffer.length;
+        if (!length) {
+          return;
+        }
+        const bucket = this.buckets.get(length) || [];
+        if (bucket.length >= this.maxPerBucket) {
+          return;
+        }
+        bucket.push(buffer);
+        this.buckets.set(length, bucket);
+      }
+    }
+
+    const displayPixelPool = window._displayPixelPool || new PixelBufferPool();
+    window._displayPixelPool = displayPixelPool;
+
     // Shared WebSocket connection for all canvases
     class SharedDisplaySocket {
       constructor(webviewuuid) {
@@ -265,10 +303,11 @@
     }
 
     class CanvasRenderManager {
-      constructor() {
+      constructor(bufferPool) {
         this.entries = new Map();
         this.rafId = null;
         this.maxQueueSize = 6;
+        this.bufferPool = bufferPool;
       }
 
       registerCanvas(uuid, canvasElement, labelElement) {
@@ -383,8 +422,14 @@
           return;
         }
         let payload = typedPixels;
+        let borrowed = false;
         if (srcOffsetX !== 0 || srcOffsetY !== 0 || copyWidth !== regionWidth || copyHeight !== regionHeight) {
-          payload = new Uint8ClampedArray(copyWidth * copyHeight * 4);
+          if (this.bufferPool) {
+            payload = this.bufferPool.acquire(copyWidth * copyHeight * 4);
+            borrowed = true;
+          } else {
+            payload = new Uint8ClampedArray(copyWidth * copyHeight * 4);
+          }
           const srcStride = regionWidth * 4;
           for (let row = 0; row < copyHeight; row++) {
             const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
@@ -392,8 +437,14 @@
             payload.set(typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4), destIndex);
           }
         }
-        const imageData = this.createImageData(ctx, payload, copyWidth, copyHeight);
-        ctx.putImageData(imageData, destX, destY);
+        try {
+          const imageData = this.createImageData(ctx, payload, copyWidth, copyHeight);
+          ctx.putImageData(imageData, destX, destY);
+        } finally {
+          if (borrowed && this.bufferPool) {
+            this.bufferPool.release(payload);
+          }
+        }
       }
 
       createImageData(ctx, pixelArray, width, height) {
@@ -441,10 +492,11 @@
     }
 
     class OffscreenCanvasManager {
-      constructor(workerScriptUrl) {
+      constructor(workerScriptUrl, bufferPool) {
         this.workerScriptUrl = workerScriptUrl;
         this.entries = new Map();
-        this.fallback = new CanvasRenderManager();
+        this.bufferPool = bufferPool;
+        this.fallback = new CanvasRenderManager(bufferPool);
       }
 
       registerCanvas(uuid, canvasElement, labelElement) {
@@ -581,8 +633,8 @@
 
     const supportsOffscreenWorkers = typeof window.OffscreenCanvas === 'function' && typeof window.Worker === 'function';
     const canvasRenderer = supportsOffscreenWorkers
-      ? new OffscreenCanvasManager('/p5/display-worker.js')
-      : new CanvasRenderManager();
+      ? new OffscreenCanvasManager('/p5/display-worker.js', displayPixelPool)
+      : new CanvasRenderManager(displayPixelPool);
     const sharedDisplaySocket = window._sharedDisplaySocket || new SharedDisplaySocket(window.uuid);
     window._sharedDisplaySocket = sharedDisplaySocket;
 

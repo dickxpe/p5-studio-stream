@@ -16,6 +16,44 @@ let targetUUIDs = [...DEFAULT_UUIDS];
 const TILE_SIZE = 8;
 const MAX_TILE_RATIO = 0.6; // Fall back to full frame if >60% pixels change
 const MAX_TILE_COUNT = 200; // Or if too many tiles would be sent
+const PIXEL_POOL_MAX_BUCKET = 24;
+
+class Uint8ClampedArrayPool {
+    constructor(maxPerBucket = PIXEL_POOL_MAX_BUCKET) {
+        this.maxPerBucket = maxPerBucket;
+        this.buckets = new Map();
+    }
+
+    acquire(length) {
+        if (!Number.isFinite(length) || length <= 0) {
+            return new Uint8ClampedArray(0);
+        }
+        const key = length;
+        const bucket = this.buckets.get(key);
+        if (bucket && bucket.length) {
+            return bucket.pop();
+        }
+        return new Uint8ClampedArray(length);
+    }
+
+    release(buffer) {
+        if (!(buffer instanceof Uint8ClampedArray)) {
+            return;
+        }
+        const length = buffer.length;
+        if (!length) {
+            return;
+        }
+        const bucket = this.buckets.get(length) || [];
+        if (bucket.length >= this.maxPerBucket) {
+            return;
+        }
+        bucket.push(buffer);
+        this.buckets.set(length, bucket);
+    }
+}
+
+const pixelPool = new Uint8ClampedArrayPool();
 
 async function refreshUUIDs() {
     try {
@@ -126,19 +164,31 @@ function sendPixelsIfNeeded() {
         return;
     }
     loadPixels();
-    const current = new Uint8ClampedArray(pixels);
+    const pixelSource = pixels instanceof Uint8ClampedArray ? pixels : new Uint8ClampedArray(pixels);
+    if (!pixelSource.length) {
+        return;
+    }
+    const current = pixelPool.acquire(pixelSource.length);
+    current.set(pixelSource);
+
     if (!lastPixels) {
-        lastPixels = current.slice();
         transmitPayload({ isFullFrame: true, pixels: current });
+        lastPixels = current;
         lastFrameSentAt = now;
         return;
     }
+
     const diff = extractDirtyTiles(current, lastPixels, width, height);
     if (!diff) {
+        pixelPool.release(lastPixels);
+        lastPixels = current;
         return;
     }
-    lastPixels = current.slice();
+
     transmitPayload(diff);
+    releaseDiffTiles(diff);
+    pixelPool.release(lastPixels);
+    lastPixels = current;
     lastFrameSentAt = now;
 }
 
@@ -235,7 +285,7 @@ function tileIsDirty(current, previous, canvasWidth, startX, startY, regionWidth
 }
 
 function copyRegionPixels(sourcePixels, canvasWidth, startX, startY, regionWidth, regionHeight) {
-    const buffer = new Uint8ClampedArray(regionWidth * regionHeight * 4);
+    const buffer = pixelPool.acquire(regionWidth * regionHeight * 4);
     const rowStride = regionWidth * 4;
     for (let row = 0; row < regionHeight; row++) {
         const srcIndex = ((startY + row) * canvasWidth + startX) * 4;
@@ -243,4 +293,15 @@ function copyRegionPixels(sourcePixels, canvasWidth, startX, startY, regionWidth
         buffer.set(sourcePixels.subarray(srcIndex, srcIndex + rowStride), destIndex);
     }
     return buffer;
+}
+
+function releaseDiffTiles(diff) {
+    if (!diff || diff.isFullFrame || !Array.isArray(diff.tiles)) {
+        return;
+    }
+    diff.tiles.forEach((tile) => {
+        if (tile && tile.pixels) {
+            pixelPool.release(tile.pixels);
+        }
+    });
 }
