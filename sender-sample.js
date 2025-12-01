@@ -7,11 +7,14 @@ const WS_ADDRESS = 'ws://localhost:3001';
 const TARGET_UUID = 'replace_me';
 const TARGET_WEBVIEWUUID = 'replace_me';
 const TARGET_FPS = 15;
+const FRAME_INTERVAL = 1000 / TARGET_FPS;
 const senderId = Math.random().toString(36).slice(2);
 let reconnectTimeout = null;
 let reconnecting = false;
 let lastFrameSentAt = 0;
-let lastPixels = null;
+let lastSentPixels = null;
+let pendingPayload = null;
+let throttleTimer = null;
 
 function connectWS() {
     if (ws) {
@@ -23,6 +26,8 @@ function connectWS() {
     ws.onopen = () => {
         reconnecting = false;
         console.log('[Sender] WebSocket opened');
+        lastFrameSentAt = 0;
+        lastSentPixels = null;
     };
     ws.onclose = () => {
         if (!reconnecting) {
@@ -56,25 +61,54 @@ function draw() {
 function sendPixelsIfNeeded() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const now = performance.now();
-    const minInterval = 1000 / TARGET_FPS;
-    if (now - lastFrameSentAt < minInterval) {
-        return;
-    }
     loadPixels();
     const current = new Uint8ClampedArray(pixels);
-    if (!lastPixels) {
-        lastPixels = current.slice();
-        transmitPayload({ isFullFrame: true, pixels: current });
-        lastFrameSentAt = now;
+    if (!lastSentPixels) {
+        queuePayload({ isFullFrame: true, pixels: current, frameSnapshot: current });
         return;
     }
-    const diff = extractDirtyRegion(current, lastPixels, width, height);
+    const diff = extractDirtyRegion(current, lastSentPixels, width, height);
     if (!diff) {
         return;
     }
-    lastPixels = current.slice();
-    transmitPayload(diff);
-    lastFrameSentAt = now;
+    diff.frameSnapshot = current;
+    queuePayload(diff);
+}
+
+function queuePayload(diff) {
+    pendingPayload = diff;
+    scheduleFlush();
+}
+
+function scheduleFlush() {
+    if (throttleTimer) return;
+    const now = performance.now();
+    const wait = Math.max(0, FRAME_INTERVAL - (now - lastFrameSentAt));
+    if (wait <= 0) {
+        flushPendingPixels();
+        return;
+    }
+    throttleTimer = setTimeout(() => {
+        throttleTimer = null;
+        flushPendingPixels();
+    }, wait);
+}
+
+function flushPendingPixels() {
+    if (!pendingPayload) {
+        return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        pendingPayload = null;
+        return;
+    }
+    const payload = pendingPayload;
+    pendingPayload = null;
+    transmitPayload(payload);
+    lastFrameSentAt = performance.now();
+    if (pendingPayload) {
+        scheduleFlush();
+    }
 }
 
 function transmitPayload(diff) {
@@ -92,6 +126,9 @@ function transmitPayload(diff) {
         payload.region = diff.region;
     }
     ws.send(JSON.stringify(payload));
+    if (diff.frameSnapshot) {
+        lastSentPixels = diff.frameSnapshot;
+    }
 }
 
 function extractDirtyRegion(current, previous, canvasWidth, canvasHeight) {

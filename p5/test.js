@@ -32,48 +32,7 @@ this.testSetup = function () {
         console.error('[WebSocket] Error', event);
         sk.statusDiv.html('WebSocket: error');
     };
-    sk.frameQueue = [];
-    sk.processingFrame = false;
-    sk.ws.onmessage = (event) => {
-        sk.statusDiv.html('WebSocket: message received');
-        let data = JSON.parse(event.data);
-        if (data.uuid === sk.uuid && Array.isArray(data.pixels)) {
-            sk.enqueuePixelPayload(data);
-        }
-    };
-    if (sk.statusDiv) sk.statusDiv.html('WebSocket: setup complete');
-};
-
-this.enqueuePixelPayload = function (payload) {
-    let sk = this;
-    sk.frameQueue.push(payload);
-    if (!sk.processingFrame) {
-        sk.processingFrame = true;
-        sk.flushFrameQueue();
-    }
-};
-
-this.flushFrameQueue = function () {
-    let sk = this;
-    if (!sk.frameQueue.length) {
-        sk.processingFrame = false;
-        return;
-    }
-    const nextFrame = sk.frameQueue.shift();
-    sk.applyPixelPayload(nextFrame);
-    window.requestAnimationFrame(() => sk.flushFrameQueue());
-};
-
-this.applyPixelPayload = function (payload) {
-    let sk = this;
-    if (!payload || !Array.isArray(payload.pixels)) {
-        return;
-    }
-    const targetWidth = sk.width;
-    const targetHeight = sk.height;
-    const typedPixels = payload.pixels instanceof Uint8ClampedArray
-        ? payload.pixels
-        : Uint8ClampedArray.from(payload.pixels);
+    sk.latestPayload = null;
     if (payload.region && !payload.isFullFrame) {
         const region = payload.region || {};
         const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
@@ -100,27 +59,84 @@ this.applyPixelPayload = function (payload) {
         }
         return;
     }
+    const payload = sk.latestPayload;
+    sk.latestPayload = null;
+    sk.applyPixelPayload(payload);
+    window.requestAnimationFrame(() => sk.flushLatestPayload());
+};
+
+this.applyPixelPayload = function (payload) {
+    let sk = this;
+    const rawPixels = payload && payload.pixels;
+    const isArray = Array.isArray(rawPixels);
+    const isTypedArray = rawPixels instanceof Uint8Array || rawPixels instanceof Uint8ClampedArray;
+    if (!payload || (!isArray && !isTypedArray)) {
+        return;
+    }
+    const typedPixels = rawPixels instanceof Uint8ClampedArray
+        ? rawPixels
+        : Uint8ClampedArray.from(rawPixels);
+    const targetWidth = sk.width;
+    const targetHeight = sk.height;
+    const targetStride = targetWidth * 4;
+    const writeRegion = (srcWidth, srcHeight, offsetX, offsetY) => {
+        const expected = srcWidth * srcHeight * 4;
+        if (typedPixels.length !== expected) {
+            console.warn('[Test Display] Region payload length mismatch', expected, typedPixels.length);
+            return false;
+        }
+        let destX = Number.isFinite(offsetX) ? Math.floor(offsetX) : 0;
+        let destY = Number.isFinite(offsetY) ? Math.floor(offsetY) : 0;
+        const srcWidthClamped = Math.max(1, Math.floor(srcWidth));
+        const srcHeightClamped = Math.max(1, Math.floor(srcHeight));
+        if (destX >= targetWidth || destY >= targetHeight) {
+            return false;
+        }
+        let srcOffsetX = 0;
+        let srcOffsetY = 0;
+        if (destX < 0) {
+            srcOffsetX = -destX;
+            destX = 0;
+        }
+        if (destY < 0) {
+            srcOffsetY = -destY;
+            destY = 0;
+        }
+        const copyWidth = Math.min(srcWidthClamped - srcOffsetX, targetWidth - destX);
+        const copyHeight = Math.min(srcHeightClamped - srcOffsetY, targetHeight - destY);
+        if (copyWidth <= 0 || copyHeight <= 0) {
+            return false;
+        }
+        const srcStride = srcWidthClamped * 4;
+        sk.loadPixels();
+        for (let row = 0; row < copyHeight; row++) {
+            const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
+            const destIndex = ((destY + row) * targetStride) + (destX * 4);
+            const rowSlice = typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4);
+            sk.pixels.set(rowSlice, destIndex);
+        }
+        sk.updatePixels();
+        return true;
+    };
+
+    if (payload.region && !payload.isFullFrame) {
+        const region = payload.region || {};
+        const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
+        const regionHeight = Number.isFinite(region.height) ? Math.max(1, Math.floor(region.height)) : 0;
+        if (!regionWidth || !regionHeight) {
+            return;
+        }
+        writeRegion(regionWidth, regionHeight, region.x, region.y);
+        return;
+    }
+
     const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
     const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
-    const expectedFull = fullWidth * fullHeight * 4;
-    if (typedPixels.length !== expectedFull) {
+    if (fullWidth === targetWidth && fullHeight === targetHeight && typedPixels.length === sk.width * sk.height * 4) {
         sk.loadPixels();
-        const max = Math.min(sk.pixels.length, typedPixels.length);
-        for (let i = 0; i < max; i++) {
-            sk.pixels[i] = typedPixels[i];
-        }
+        sk.pixels.set(typedPixels);
         sk.updatePixels();
         return;
     }
-    try {
-        const imageData = new ImageData(typedPixels, fullWidth, fullHeight);
-        sk.drawingContext.putImageData(imageData, 0, 0);
-    } catch (err) {
-        sk.loadPixels();
-        const max = Math.min(sk.pixels.length, typedPixels.length);
-        for (let i = 0; i < max; i++) {
-            sk.pixels[i] = typedPixels[i];
-        }
-        sk.updatePixels();
-    }
+    writeRegion(fullWidth, fullHeight, 0, 0);
 };

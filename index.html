@@ -7,7 +7,7 @@
   <script src="/p5/p5.min.js"></script>
   <script id="p5-test-script" type="text/plain" src="/p5/test.js"></script>
   <style>
-    body { margin: 0; padding: 0; overflow: hidden; }
+    body { margin: 0; padding: 0; overflow: auto; background: #fff; }
     #canvases {
       position: absolute;
       left: 0;
@@ -74,7 +74,7 @@
       border: none;
       outline: none;
       box-shadow: none;
-      background: none;
+      background: #fff;
       font-size: 0;
       line-height: 0;
       image-rendering: pixelated;
@@ -89,6 +89,9 @@
   <script>
     const canvasWidthPx = typeof window.gridWidth === 'number' ? window.gridWidth : 100;
     const canvasHeightPx = typeof window.gridHeight === 'number' ? window.gridHeight : 100;
+    const deviceScale = window.devicePixelRatio || 1;
+    const cssCanvasWidth = canvasWidthPx / deviceScale;
+    const cssCanvasHeight = canvasHeightPx / deviceScale;
     // Always use gridRows and gridCols if present (injected by server)
     const cols = typeof window.gridCols === 'number' ? window.gridCols : 10;
     const rows = typeof window.gridRows === 'number' ? window.gridRows : 10;
@@ -143,9 +146,8 @@
                 sk.uuid = sk.uuid || assignedUUID;
                 sk.webviewuuid = sk.webviewuuid || window.webviewuuid || window.uuid;
 
-                sk.frameQueue = [];
-                sk.processingFrame = false;
-                sk.lastFrameTime = 0;
+                sk.latestPayload = null;
+                sk.frameProcessing = false;
 
                 sk.ws = new window.WebSocket('ws://localhost:3001');
                 sk.ws.onopen = () => {
@@ -159,39 +161,84 @@
                 sk.ws.onerror = (event) => {};
                 sk.ws.onmessage = (event) => {
                   let data = JSON.parse(event.data);
-                  if (data.uuid === sk.uuid && Array.isArray(data.pixels)) {
+                  const pixelsField = data.pixels;
+                  const hasPixels = Array.isArray(pixelsField) || pixelsField instanceof Uint8Array || pixelsField instanceof Uint8ClampedArray;
+                  if (data.uuid === sk.uuid && hasPixels) {
                     label.style.display = 'none';
                     sk.enqueuePixelPayload(data);
                   }
                 };
               };
               sk.enqueuePixelPayload = function(payload) {
-                sk.frameQueue.push(payload);
-                if (!sk.processingFrame) {
-                  sk.processingFrame = true;
-                  sk.flushFrameQueue();
+                sk.latestPayload = payload;
+                if (!sk.frameProcessing) {
+                  sk.frameProcessing = true;
+                  window.requestAnimationFrame(sk.flushLatestPayload);
                 }
               };
-              sk.flushFrameQueue = function() {
-                if (sk.frameQueue.length === 0) {
-                  sk.processingFrame = false;
+              sk.flushLatestPayload = function() {
+                if (!sk.latestPayload) {
+                  sk.frameProcessing = false;
                   return;
                 }
-                const nextFrame = sk.frameQueue.shift();
-                sk.applyPixelPayload(nextFrame);
-                window.requestAnimationFrame(() => {
-                  sk.flushFrameQueue();
-                });
+                const payload = sk.latestPayload;
+                sk.latestPayload = null;
+                sk.applyPixelPayload(payload);
+                window.requestAnimationFrame(sk.flushLatestPayload);
               };
               sk.applyPixelPayload = function(payload) {
-                if (!payload || !Array.isArray(payload.pixels)) {
+                const rawPixels = payload && payload.pixels;
+                const isArray = Array.isArray(rawPixels);
+                const isTypedArray = rawPixels instanceof Uint8Array || rawPixels instanceof Uint8ClampedArray;
+                if (!payload || (!isArray && !isTypedArray)) {
                   return;
                 }
+                const typedPixels = rawPixels instanceof Uint8ClampedArray
+                  ? rawPixels
+                  : Uint8ClampedArray.from(rawPixels);
                 const targetWidth = sk.width;
                 const targetHeight = sk.height;
-                const typedPixels = payload.pixels instanceof Uint8ClampedArray
-                  ? payload.pixels
-                  : Uint8ClampedArray.from(payload.pixels);
+                const targetStride = targetWidth * 4;
+                const writeRegion = (srcWidth, srcHeight, offsetX, offsetY) => {
+                  const expected = srcWidth * srcHeight * 4;
+                  if (typedPixels.length !== expected) {
+                    console.warn('[Display] Region payload length mismatch', expected, typedPixels.length);
+                    return false;
+                  }
+                  let destX = Number.isFinite(offsetX) ? Math.floor(offsetX) : 0;
+                  let destY = Number.isFinite(offsetY) ? Math.floor(offsetY) : 0;
+                  const srcWidthClamped = Math.max(1, Math.floor(srcWidth));
+                  const srcHeightClamped = Math.max(1, Math.floor(srcHeight));
+                  if (destX >= targetWidth || destY >= targetHeight) {
+                    return false;
+                  }
+                  let srcOffsetX = 0;
+                  let srcOffsetY = 0;
+                  if (destX < 0) {
+                    srcOffsetX = -destX;
+                    destX = 0;
+                  }
+                  if (destY < 0) {
+                    srcOffsetY = -destY;
+                    destY = 0;
+                  }
+                  const copyWidth = Math.min(srcWidthClamped - srcOffsetX, targetWidth - destX);
+                  const copyHeight = Math.min(srcHeightClamped - srcOffsetY, targetHeight - destY);
+                  if (copyWidth <= 0 || copyHeight <= 0) {
+                    return false;
+                  }
+                  const srcStride = srcWidthClamped * 4;
+                  sk.loadPixels();
+                  for (let row = 0; row < copyHeight; row++) {
+                    const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
+                    const destIndex = ((destY + row) * targetStride) + (destX * 4);
+                    const rowSlice = typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4);
+                    sk.pixels.set(rowSlice, destIndex);
+                  }
+                  sk.updatePixels();
+                  return true;
+                };
+
                 if (payload.region && !payload.isFullFrame) {
                   const region = payload.region || {};
                   const regionWidth = Number.isFinite(region.width) ? Math.max(1, Math.floor(region.width)) : 0;
@@ -199,48 +246,19 @@
                   if (!regionWidth || !regionHeight) {
                     return;
                   }
-                  const expected = regionWidth * regionHeight * 4;
-                  if (typedPixels.length < expected) {
-                    return;
-                  }
-                  let destX = Number.isFinite(region.x) ? Math.floor(region.x) : 0;
-                  let destY = Number.isFinite(region.y) ? Math.floor(region.y) : 0;
-                  if (destX >= targetWidth || destY >= targetHeight) {
-                    return;
-                  }
-                  if (destX < 0) destX = 0;
-                  if (destY < 0) destY = 0;
-                  try {
-                    const imageData = new ImageData(typedPixels, regionWidth, regionHeight);
-                    sk.drawingContext.putImageData(imageData, destX, destY);
-                  } catch (err) {
-                    console.warn('[Display] Failed to draw region payload', err);
-                  }
+                  writeRegion(regionWidth, regionHeight, region.x, region.y);
                   return;
                 }
+
                 const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
                 const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
-                const expectedFull = fullWidth * fullHeight * 4;
-                if (typedPixels.length !== expectedFull) {
+                if (fullWidth === targetWidth && fullHeight === targetHeight && typedPixels.length === sk.width * sk.height * 4) {
                   sk.loadPixels();
-                  const max = Math.min(sk.pixels.length, typedPixels.length);
-                  for (let i = 0; i < max; i++) {
-                    sk.pixels[i] = typedPixels[i];
-                  }
+                  sk.pixels.set(typedPixels);
                   sk.updatePixels();
                   return;
                 }
-                try {
-                  const imageData = new ImageData(typedPixels, fullWidth, fullHeight);
-                  sk.drawingContext.putImageData(imageData, 0, 0);
-                } catch (err) {
-                  sk.loadPixels();
-                  const max = Math.min(sk.pixels.length, typedPixels.length);
-                  for (let i = 0; i < max; i++) {
-                    sk.pixels[i] = typedPixels[i];
-                  }
-                  sk.updatePixels();
-                }
+                writeRegion(fullWidth, fullHeight, 0, 0);
               };
               sk.uuid = assignedUUID;
             }, container);
@@ -255,6 +273,8 @@
             placeholder.style.margin = '0';
             placeholder.style.padding = '0';
             placeholder.style.display = 'block';
+            placeholder.style.width = cssCanvasWidth + 'px';
+            placeholder.style.height = cssCanvasHeight + 'px';
             container.appendChild(placeholder);
             gridPlaceholders.push(placeholder);
             // Add overlay label
@@ -352,23 +372,22 @@
       }
       */
       // Set grid and canvas sizes to database-provided base size
-      const totalWidth = gridCols * canvasWidthPx;
-      const totalHeight = gridRows * canvasHeightPx;
+      const totalWidth = gridCols * cssCanvasWidth;
+      const totalHeight = gridRows * cssCanvasHeight;
       canvasesDiv.style.width = totalWidth + 'px';
       canvasesDiv.style.height = totalHeight + 'px';
       canvasesDiv.style.setProperty('--cols', gridCols);
       canvasesDiv.style.setProperty('--rows', gridRows);
       const viewportW = window.innerWidth;
       const viewportH = window.innerHeight;
-      const scale = Math.min(1, Math.min(viewportW / totalWidth, viewportH / totalHeight));
-      const offsetX = (viewportW - totalWidth * scale) / 2;
-      const offsetY = (viewportH - totalHeight * scale) / 2;
-      canvasesDiv.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+      const offsetX = Math.max(0, (viewportW - totalWidth) / 2);
+      const offsetY = Math.max(0, (viewportH - totalHeight) / 2);
+      canvasesDiv.style.transform = `translate(${offsetX}px, ${offsetY}px)`;
       const outerContainers = document.querySelectorAll('.p5canvas-outer');
       for (let i = 0; i < outerContainers.length; i++) {
         if (outerContainers[i]) {
-          outerContainers[i].style.width = canvasWidthPx + 'px';
-          outerContainers[i].style.height = canvasHeightPx + 'px';
+          outerContainers[i].style.width = cssCanvasWidth + 'px';
+          outerContainers[i].style.height = cssCanvasHeight + 'px';
         }
       }
       for (let i = 0; i < gridContainers.length; i++) {
@@ -379,14 +398,14 @@
       }
       for (let i = 0; i < gridCanvases.length; i++) {
         if (gridCanvases[i]) {
-          gridCanvases[i].style.width = canvasWidthPx + 'px';
-          gridCanvases[i].style.height = canvasHeightPx + 'px';
+          gridCanvases[i].style.width = cssCanvasWidth + 'px';
+          gridCanvases[i].style.height = cssCanvasHeight + 'px';
         }
       }
       for (let i = 0; i < gridPlaceholders.length; i++) {
         if (gridPlaceholders[i]) {
-          gridPlaceholders[i].style.width = canvasWidthPx + 'px';
-          gridPlaceholders[i].style.height = canvasHeightPx + 'px';
+          gridPlaceholders[i].style.width = cssCanvasWidth + 'px';
+          gridPlaceholders[i].style.height = cssCanvasHeight + 'px';
         }
       }
     }
