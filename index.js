@@ -604,7 +604,7 @@ const server = http.createServer((req, res) => {
           h1 { color: #225577; margin-top: 10vh; }
           p { color: #336699; font-size: 1.2em; margin-top: 2em; }
           .input-wrap { margin-top: 2em; }
-          input[type=text] { font-size: 1.1em; padding: 0.5em 1em; border-radius: 6px; border: 1px solid #336699; width: 220px; }
+          input[type=text], input[type=email] { font-size: 1.1em; padding: 0.5em 1em; border-radius: 6px; border: 1px solid #336699; width: 220px; }
           button { font-size: 1.1em; padding: 0.5em 1.5em; border-radius: 6px; border: 1px solid #336699; background: #eaf4fa; color: #225577; margin-left: 1em; cursor: pointer; }
           button:hover { background: #d2e9fa; color: #113355; }
           .error { color: #b00; margin-top: 1em; }
@@ -614,34 +614,58 @@ const server = http.createServer((req, res) => {
         <h1>Welcome to p5 Studio Stream</h1>
         <p>Paste a webview UUID to join:</p>
         <div class="input-wrap">
-          <input id="uuidInput" type="text" placeholder="Enter webviewuuid" maxlength="32" />
+          <input id="emailInput" type="email" placeholder="Enter your email" required />
         </div>
         <div class="input-wrap">
-          <input id="emailInput" type="email" placeholder="Enter your email" />
+          <input id="uuidInput" type="text" placeholder="Enter webviewuuid" maxlength="32" />
           <button onclick="goToWebview()">Go</button>
         </div>
         <div class="error" id="error"></div>
         <script>
           function goToWebview() {
-            var uuid = document.getElementById('uuidInput').value.trim();
-            var email = document.getElementById('emailInput').value.trim();
+            var uuidField = document.getElementById('uuidInput');
+            var uuid = uuidField.value.trim();
+            var emailField = document.getElementById('emailInput');
+            var email = emailField.value.trim();
+            uuidField.setCustomValidity('');
             if (!uuid) {
               showError('Please enter a webviewuuid.');
+              uuidField.focus();
               return;
             }
             if (!email) {
               showError('Please enter your email.');
+              emailField.focus();
+              return;
+            }
+            if (!emailField.checkValidity()) {
+              showError('Please enter a valid email address.');
+              emailField.focus();
               return;
             }
             fetch('/check-webviewuuid/' + encodeURIComponent(uuid))
               .then(r => r.json())
               .then(data => {
-                if (data.exists) {
-                  var params = new URLSearchParams({ email: email });
-                  window.location.href = '/link/' + encodeURIComponent(uuid) + '?' + params.toString();
-                } else {
+                if (!data.exists) {
                   showError('Webview UUID not found.');
+                  uuidField.setCustomValidity('Webview UUID not found.');
+                  uuidField.reportValidity();
+                  uuidField.focus();
+                  return;
                 }
+                if (data.full) {
+                  var capacityMsg = (typeof data.used === 'number' && typeof data.capacity === 'number')
+                    ? ' (' + data.used + '/' + data.capacity + ' slots used)'
+                    : '';
+                  showError('This webview is full.' + capacityMsg);
+                  uuidField.setCustomValidity('This webview is full.');
+                  uuidField.reportValidity();
+                  uuidField.focus();
+                  return;
+                }
+                uuidField.setCustomValidity('');
+                var params = new URLSearchParams({ email: email });
+                window.location.href = '/link/' + encodeURIComponent(uuid) + '?' + params.toString();
               })
               .catch(() => showError('Error checking webviewuuid.'));
           }
@@ -652,15 +676,37 @@ const server = http.createServer((req, res) => {
       </body>
       </html>`);
   } else if (req.url.startsWith("/check-webviewuuid/")) {
-    // AJAX endpoint to check if a webviewuuid exists
+    // AJAX endpoint to check if a webviewuuid exists and whether it's full
     const uuid = decodeURIComponent(req.url.split("/check-webviewuuid/")[1] || "");
     const sqlite3 = require('sqlite3').verbose();
     const dbPath = require('path').join(__dirname, 'uuids.db');
     const db = new sqlite3.Database(dbPath);
-    db.get('SELECT 1 FROM webviews WHERE webviewuuid = ?', [uuid], (err, row) => {
-      db.close();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ exists: !!row }));
+    db.get('SELECT rows, columns FROM webviews WHERE webviewuuid = ?', [uuid], (err, webview) => {
+      if (err) {
+        db.close();
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+      if (!webview) {
+        db.close();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ exists: false }));
+        return;
+      }
+      db.get('SELECT COUNT(*) as count FROM uuids WHERE webviewuuid = ?', [uuid], (countErr, row) => {
+        db.close();
+        if (countErr) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: countErr.message }));
+          return;
+        }
+        const used = row ? row.count : 0;
+        const capacity = (webview.rows || 10) * (webview.columns || 10);
+        const full = used >= capacity;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ exists: true, full, used, capacity }));
+      });
     });
   } else if (/^\/[a-zA-Z0-9]{8}$/.test(req.url)) {
     // Serve the grid page at /:uuid and expose uuid to frontend
