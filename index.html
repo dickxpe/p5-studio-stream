@@ -50,9 +50,12 @@
       width: 100%;
       max-width: 90%;
       overflow: visible;
-      line-height: 1.7;
+      line-height: 1;
       white-space: normal;
       height: 90%;
+    }
+    .canvas-label span + span {
+      margin-top: 4px;
     }
 
     .p5canvas {
@@ -96,6 +99,99 @@
     const cols = typeof window.gridCols === 'number' ? window.gridCols : 10;
     const rows = typeof window.gridRows === 'number' ? window.gridRows : 10;
     const canvasesDiv = document.getElementById('canvases');
+
+    // Shared WebSocket connection for all canvases
+    class SharedDisplaySocket {
+      constructor(webviewuuid) {
+        this.webviewuuid = webviewuuid;
+        this.handlers = new Map();
+        this.ws = null;
+        this.reconnectDelay = 1000;
+        this.reconnectTimer = null;
+        this.connect();
+      }
+
+      connect() {
+        try {
+          this.ws = new window.WebSocket('ws://localhost:3001');
+        } catch (err) {
+          console.error('[DisplaySocket] Failed to create WebSocket', err);
+          this.scheduleReconnect();
+          return;
+        }
+        this.ws.onopen = () => {
+          this.handlers.forEach((_, uuid) => {
+            this.sendRegistration(uuid);
+          });
+        };
+        this.ws.onmessage = (event) => {
+          this.handleMessage(event);
+        };
+        this.ws.onerror = (event) => {
+          console.warn('[DisplaySocket] WebSocket error', event);
+        };
+        this.ws.onclose = () => {
+          this.ws = null;
+          this.scheduleReconnect();
+        };
+      }
+
+      scheduleReconnect() {
+        if (this.reconnectTimer) return;
+        this.reconnectTimer = window.setTimeout(() => {
+          this.reconnectTimer = null;
+          this.connect();
+        }, this.reconnectDelay);
+      }
+
+      isOpen() {
+        return this.ws && this.ws.readyState === window.WebSocket.OPEN;
+      }
+
+      sendRegistration(uuid) {
+        if (!this.isOpen()) return;
+        const payload = {
+          webviewuuid: this.webviewuuid,
+          uuid,
+          pixels: []
+        };
+        this.ws.send(JSON.stringify(payload));
+      }
+
+      register(uuid, handler) {
+        this.handlers.set(uuid, handler);
+        if (this.isOpen()) {
+          this.sendRegistration(uuid);
+        }
+      }
+
+      handleMessage(event) {
+        let data;
+        if (typeof event.data === 'string') {
+          try {
+            data = JSON.parse(event.data);
+          } catch (err) {
+            console.warn('[DisplaySocket] Failed to parse message', err);
+            return;
+          }
+        } else if (event.data instanceof ArrayBuffer) {
+          // Assume binary messages are not used for now
+          return;
+        } else {
+          return;
+        }
+        if (!data || typeof data.uuid === 'undefined') {
+          return;
+        }
+        const handler = this.handlers.get(data.uuid);
+        if (handler) {
+          handler(data);
+        }
+      }
+    }
+
+    const sharedDisplaySocket = window._sharedDisplaySocket || new SharedDisplaySocket(window.uuid);
+    window._sharedDisplaySocket = sharedDisplaySocket;
 
     // --- Responsive grid: create once, rescale on resize ---
     let gridInitialized = false;
@@ -142,6 +238,7 @@
                 sk.background(255);
                 sk.width = canvasWidthPx;
                 sk.height = canvasHeightPx;
+                sk.ctx2d = (sk._renderer && sk._renderer.drawingContext) || null;
 
                 sk.uuid = sk.uuid || assignedUUID;
                 sk.webviewuuid = sk.webviewuuid || window.webviewuuid || window.uuid;
@@ -149,25 +246,15 @@
                 sk.latestPayload = null;
                 sk.frameProcessing = false;
 
-                sk.ws = new window.WebSocket('ws://localhost:3001');
-                sk.ws.onopen = () => {
-                  sk.ws.send(JSON.stringify({
-                    webviewuuid: sk.webviewuuid,
-                    uuid: sk.uuid,
-                    pixels: []
-                  }));
-                };
-                sk.ws.onclose = (event) => {};
-                sk.ws.onerror = (event) => {};
-                sk.ws.onmessage = (event) => {
-                  let data = JSON.parse(event.data);
-                  const pixelsField = data.pixels;
+                const handleIncomingFrame = (payload) => {
+                  const pixelsField = payload && payload.pixels;
                   const hasPixels = Array.isArray(pixelsField) || pixelsField instanceof Uint8Array || pixelsField instanceof Uint8ClampedArray;
-                  if (data.uuid === sk.uuid && hasPixels) {
+                  if (payload.uuid === sk.uuid && hasPixels) {
                     label.style.display = 'none';
-                    sk.enqueuePixelPayload(data);
+                    sk.enqueuePixelPayload(payload);
                   }
                 };
+                sharedDisplaySocket.register(sk.uuid, handleIncomingFrame);
               };
               sk.enqueuePixelPayload = function(payload) {
                 sk.latestPayload = payload;
@@ -198,7 +285,19 @@
                   : Uint8ClampedArray.from(rawPixels);
                 const targetWidth = sk.width;
                 const targetHeight = sk.height;
-                const targetStride = targetWidth * 4;
+                const ctx = sk.ctx2d;
+                if (!ctx) {
+                  return;
+                }
+                const ensureImageData = (pixelData, w, h) => {
+                  try {
+                    return new ImageData(pixelData, w, h);
+                  } catch (err) {
+                    const imageData = ctx.createImageData(w, h);
+                    imageData.data.set(pixelData);
+                    return imageData;
+                  }
+                };
                 const writeRegion = (srcWidth, srcHeight, offsetX, offsetY) => {
                   const expected = srcWidth * srcHeight * 4;
                   if (typedPixels.length !== expected) {
@@ -228,14 +327,19 @@
                     return false;
                   }
                   const srcStride = srcWidthClamped * 4;
-                  sk.loadPixels();
-                  for (let row = 0; row < copyHeight; row++) {
-                    const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
-                    const destIndex = ((destY + row) * targetStride) + (destX * 4);
-                    const rowSlice = typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4);
-                    sk.pixels.set(rowSlice, destIndex);
+                  const needsCrop = srcOffsetX !== 0 || srcOffsetY !== 0 || copyWidth !== srcWidthClamped || copyHeight !== srcHeightClamped;
+                  let payload = typedPixels;
+                  if (needsCrop) {
+                    payload = new Uint8ClampedArray(copyWidth * copyHeight * 4);
+                    for (let row = 0; row < copyHeight; row++) {
+                      const srcIndex = ((srcOffsetY + row) * srcStride) + (srcOffsetX * 4);
+                      const destIndex = row * copyWidth * 4;
+                      const rowSlice = typedPixels.subarray(srcIndex, srcIndex + copyWidth * 4);
+                      payload.set(rowSlice, destIndex);
+                    }
                   }
-                  sk.updatePixels();
+                  const imageData = ensureImageData(payload, copyWidth, copyHeight);
+                  ctx.putImageData(imageData, destX, destY);
                   return true;
                 };
 
@@ -253,9 +357,8 @@
                 const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
                 const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
                 if (fullWidth === targetWidth && fullHeight === targetHeight && typedPixels.length === sk.width * sk.height * 4) {
-                  sk.loadPixels();
-                  sk.pixels.set(typedPixels);
-                  sk.updatePixels();
+                  const imageData = ensureImageData(typedPixels, targetWidth, targetHeight);
+                  ctx.putImageData(imageData, 0, 0);
                   return;
                 }
                 writeRegion(fullWidth, fullHeight, 0, 0);

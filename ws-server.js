@@ -12,89 +12,74 @@ const canvasSockets = new Map();
 
 const wss = new WebSocket.Server({ port: 3001 });
 
-
 wss.on('connection', (ws) => {
-    let webviewuuid = null;
-    let uuid = null;
-    let isDisplay = false;
+    ws.displayRegistrations = new Set();
+    ws.senderRegistrations = new Set();
     console.log('[WS] New client connected');
 
     ws.on('message', (message) => {
-        // Convert Buffer to string if necessary
-        let msgStr = (typeof message === 'string') ? message : message.toString();
-        // console.log(`[RAW MESSAGE]`, msgStr);
+        const msgStr = (typeof message === 'string') ? message : message.toString();
         try {
             const data = JSON.parse(msgStr);
+            if (!isValidPayload(data)) {
+                console.log('[WS] Message missing required fields:', data);
+                return;
+            }
+            const webviewuuid = data.webviewuuid;
+            const uuid = normalizeUuid(data.uuid);
             const senderId = data.senderId || 'none';
-            if (
-                typeof data.webviewuuid === 'string' &&
-                (typeof data.uuid === 'string' || typeof data.uuid === 'number') &&
-                Array.isArray(data.pixels)
-            ) {
-                webviewuuid = data.webviewuuid;
-                uuid = data.uuid;
-                // Register this socket
-                if (!canvasSockets.has(webviewuuid)) {
-                    canvasSockets.set(webviewuuid, new Map());
-                    console.log(`[${webviewuuid}] New webviewuuid registered`);
-                }
-                const uuidMap = canvasSockets.get(webviewuuid);
-                if (!uuidMap.has(uuid)) {
-                    uuidMap.set(uuid, { display: ws, senders: new Set() });
-                    isDisplay = true;
-                    console.log(`[${webviewuuid}/${uuid}] Display client registered`);
-                } else {
-                    const senderSet = uuidMap.get(uuid).senders;
-                    if (!senderSet.has(ws)) {
-                        senderSet.add(ws);
-                        console.log(`[${webviewuuid}/${uuid}] Sender client registered (senderId: ${senderId})`);
+            const entry = ensureEntry(webviewuuid, uuid);
+            const key = makeKey(webviewuuid, uuid);
+            const isDisplayRegistration = isDisplayHandshake(data);
+
+            if (isDisplayRegistration) {
+                if (entry.display && entry.display !== ws) {
+                    try {
+                        entry.display.close(1000, 'Display replaced');
+                    } catch (err) {
+                        console.warn(`[${webviewuuid}/${uuid}] Failed to close previous display`, err);
                     }
                 }
-                // If this is a sender, forward to display
-                if (!isDisplay) {
-                    const entry = uuidMap.get(uuid);
-                    const displayWs = entry && entry.display;
-                    if (displayWs && displayWs.readyState === WebSocket.OPEN) {
-                        const region = sanitizeRegion(data.region);
-                        const payload = {
-                            uuid,
-                            pixels: data.pixels,
-                            region,
-                            isFullFrame: !!data.isFullFrame,
-                            fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : undefined,
-                            fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined
-                        };
-                        displayWs.send(JSON.stringify(payload));
-                        console.log(`[${webviewuuid}/${uuid}] Pixel data sent to display client (${data.pixels.length} values${region ? ', region' : ', full frame'})`);
-                    } else {
-                        console.log(`[${webviewuuid}/${uuid}] No display client to send pixel data`);
-                    }
-                } else {
-                    console.log(`[${webviewuuid}/${uuid}] Display client ready and waiting for pixel data`);
-                }
+                entry.display = ws;
+                ws.displayRegistrations.add(key);
+                console.log(`[${webviewuuid}/${uuid}] Display client registered`);
+                return;
+            }
+
+            if (!entry.senders.has(ws)) {
+                entry.senders.add(ws);
+                ws.senderRegistrations.add(key);
+                console.log(`[${webviewuuid}/${uuid}] Sender client registered (senderId: ${senderId})`);
+            }
+
+            const displayWs = entry.display;
+            if (displayWs && displayWs.readyState === WebSocket.OPEN) {
+                const region = sanitizeRegion(data.region);
+                const payload = {
+                    uuid,
+                    pixels: data.pixels,
+                    region,
+                    isFullFrame: !!data.isFullFrame,
+                    fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : undefined,
+                    fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : undefined
+                };
+                displayWs.send(JSON.stringify(payload));
+                console.log(`[${webviewuuid}/${uuid}] Pixel data sent to display client (${data.pixels.length} values${region ? ', region' : ', full frame'})`);
             } else {
-                console.log(`[WS] Message missing required fields:`, data);
+                console.log(`[${webviewuuid}/${uuid}] No display client to send pixel data`);
             }
         } catch (e) {
             console.error('[WS] Failed to parse message:', e);
-            ws.send(JSON.stringify({ error: 'Invalid message format' }));
+            try {
+                ws.send(JSON.stringify({ error: 'Invalid message format' }));
+            } catch (sendErr) {
+                console.warn('[WS] Failed to send error response', sendErr);
+            }
         }
     });
 
     ws.on('close', (code, reason) => {
-        let role = isDisplay ? 'Display' : 'Sender';
-        console.log(`[${webviewuuid}/${uuid}] ${role} client disconnected (code: ${code}, reason: ${reason})`);
-        if (webviewuuid && uuid && canvasSockets.has(webviewuuid)) {
-            const uuidMap = canvasSockets.get(webviewuuid);
-            if (isDisplay) {
-                uuidMap.delete(uuid);
-            } else if (uuidMap.has(uuid)) {
-                uuidMap.get(uuid).senders.delete(ws);
-            }
-            if (uuidMap.size === 0) {
-                canvasSockets.delete(webviewuuid);
-            }
-        }
+        cleanupConnection(ws, code, reason);
     });
 });
 
@@ -108,4 +93,95 @@ function sanitizeRegion(region) {
     const height = Number.isFinite(region.height) ? Math.max(1, region.height) : null;
     if (!width || !height) return null;
     return { x, y, width, height };
+}
+
+function isValidPayload(data) {
+    return data &&
+        typeof data.webviewuuid === 'string' &&
+        (typeof data.uuid === 'string' || typeof data.uuid === 'number') &&
+        Array.isArray(data.pixels);
+}
+
+function normalizeUuid(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return String(Math.trunc(value));
+    }
+    if (typeof value === 'string') {
+        return value;
+    }
+    return '';
+}
+
+function isDisplayHandshake(data) {
+    return Array.isArray(data.pixels) && data.pixels.length === 0 && !data.senderId;
+}
+
+function makeKey(webviewuuid, uuid) {
+    return JSON.stringify({ webviewuuid, uuid });
+}
+
+function splitKey(key) {
+    try {
+        return JSON.parse(key);
+    } catch (err) {
+        return { webviewuuid: null, uuid: null };
+    }
+}
+
+function ensureEntry(webviewuuid, uuid) {
+    if (!canvasSockets.has(webviewuuid)) {
+        canvasSockets.set(webviewuuid, new Map());
+        console.log(`[${webviewuuid}] New webviewuuid registered`);
+    }
+    const uuidMap = canvasSockets.get(webviewuuid);
+    if (!uuidMap.has(uuid)) {
+        uuidMap.set(uuid, { display: null, senders: new Set() });
+        console.log(`[${webviewuuid}/${uuid}] Slot initialized`);
+    }
+    return uuidMap.get(uuid);
+}
+
+function getEntry(webviewuuid, uuid) {
+    if (!canvasSockets.has(webviewuuid)) return null;
+    return canvasSockets.get(webviewuuid).get(uuid) || null;
+}
+
+function cleanupEntry(webviewuuid, uuid) {
+    if (!canvasSockets.has(webviewuuid)) return;
+    const uuidMap = canvasSockets.get(webviewuuid);
+    const entry = uuidMap.get(uuid);
+    if (!entry) return;
+    if (!entry.display && entry.senders.size === 0) {
+        uuidMap.delete(uuid);
+        if (uuidMap.size === 0) {
+            canvasSockets.delete(webviewuuid);
+        }
+    }
+}
+
+function cleanupConnection(ws, code, reason) {
+    ws.displayRegistrations.forEach((key) => {
+        const { webviewuuid, uuid } = splitKey(key);
+        if (!webviewuuid || typeof uuid === 'undefined') {
+            return;
+        }
+        const entry = getEntry(webviewuuid, uuid);
+        if (entry && entry.display === ws) {
+            entry.display = null;
+            console.log(`[${webviewuuid}/${uuid}] Display client disconnected (code: ${code}, reason: ${reason})`);
+            cleanupEntry(webviewuuid, uuid);
+        }
+    });
+    ws.senderRegistrations.forEach((key) => {
+        const { webviewuuid, uuid } = splitKey(key);
+        if (!webviewuuid || typeof uuid === 'undefined') {
+            return;
+        }
+        const entry = getEntry(webviewuuid, uuid);
+        if (entry && entry.senders.has(ws)) {
+            entry.senders.delete(ws);
+            console.log(`[${webviewuuid}/${uuid}] Sender client disconnected (code: ${code}, reason: ${reason})`);
+            cleanupEntry(webviewuuid, uuid);
+        }
+    });
 }

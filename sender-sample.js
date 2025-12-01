@@ -1,134 +1,166 @@
 /*
  * Sample p5 sender sketch that transmits only changed pixels.
- * Replace TARGET_UUID and TARGET_WEBVIEWUUID with your own values.
+ * Replace TARGET_WEBVIEWUUID with your own value.
  */
-let ws;
+const DEFAULT_UUIDS = Array.from({ length: 100 }, (_, i) => String(i));
 const WS_ADDRESS = 'ws://localhost:3001';
-const TARGET_UUID = 'replace_me';
-const TARGET_WEBVIEWUUID = 'replace_me';
-const TARGET_FPS = 15;
-const FRAME_INTERVAL = 1000 / TARGET_FPS;
+const TARGET_WEBVIEWUUID = 'testuuid';
+const TARGET_FPS = 30;
 const senderId = Math.random().toString(36).slice(2);
-let reconnectTimeout = null;
-let reconnecting = false;
 let lastFrameSentAt = 0;
-let lastSentPixels = null;
-let pendingPayload = null;
-let throttleTimer = null;
+let lastPixels = null;
+let ws = null;
+let reconnectTimer = null;
+const RECONNECT_DELAY_MS = 1000;
+let targetUUIDs = [...DEFAULT_UUIDS];
+
+async function refreshUUIDs() {
+    try {
+        const resp = await fetch(`/uuids/${TARGET_WEBVIEWUUID}`);
+        if (!resp.ok) {
+            throw new Error(`Unexpected status ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (Array.isArray(data) && data.length > 0) {
+            targetUUIDs = data.map((value) => String(value));
+            console.log(`[Sender] Loaded ${targetUUIDs.length} UUIDs from server`);
+            return;
+        }
+        console.warn('[Sender] UUID response empty, falling back to defaults');
+    } catch (err) {
+        console.warn('[Sender] Failed to load UUIDs, using defaults', err);
+    }
+    targetUUIDs = [...DEFAULT_UUIDS];
+}
+
+const myShape = {
+    x: 100,
+    y: 50,
+    w: 50,
+    h: 50,
+    c: 250
+};
 
 function connectWS() {
     if (ws) {
         ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
         try { ws.close(); } catch (e) { }
-        ws = null;
     }
     ws = new WebSocket(WS_ADDRESS);
     ws.onopen = () => {
-        reconnecting = false;
-        console.log('[Sender] WebSocket opened');
-        lastFrameSentAt = 0;
-        lastSentPixels = null;
-    };
-    ws.onclose = () => {
-        if (!reconnecting) {
-            reconnecting = true;
-            reconnectTimeout = setTimeout(connectWS, 3000);
+        console.log('[Sender] Multiplex socket opened');
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
         }
-        console.log('[Sender] WebSocket closed');
+    };
+    ws.onclose = (evt) => {
+        console.log('[Sender] Multiplex socket closed', evt.code, evt.reason);
+        ws = null;
+        scheduleReconnect();
     };
     ws.onerror = (err) => {
-        console.log('[Sender] WebSocket error', err);
+        console.warn('[Sender] Multiplex socket error', err);
     };
     ws.onmessage = (event) => {
         console.log('[Sender] Message from server:', event.data);
     };
 }
 
+function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectWS();
+    }, RECONNECT_DELAY_MS);
+}
+
 function setup() {
     pixelDensity(1);
-    createCanvas(1280, 720);
+    createCanvas(200, 200);
     background(255);
-    connectWS();
+    refreshUUIDs().finally(connectWS);
+
+    p5.tween.manager.addTween(myShape, 'tween1')
+        .addMotions([
+            { key: 'y', target: height },
+            { key: 'w', target: 30 },
+            { key: 'h', target: 80 },
+        ], 600, 'easeInQuad')
+        .addMotions([
+            { key: 'w', target: 100 },
+            { key: 'h', target: 10 },
+        ], 120)
+        .addMotions([
+            { key: 'w', target: 10 },
+            { key: 'h', target: 100 },
+        ], 100)
+        .addMotions([
+            { key: 'w', target: 50 },
+            { key: 'h', target: 50 },
+            { key: 'y', target: 100 }
+        ], 500, 'easeOutQuad')
+        .onLoop((tween) => myShape.c = random(0, 255))
+        .startLoop();
 }
 
 function draw() {
-    if (frameCount % 60 === 0) {
-        background(random(255), random(255), random(255));
+    if (frameCount % 2 === 0) {
+        background(250);
+        noStroke();
+        fill(myShape.c, 125, 125);
+        ellipse(myShape.x, myShape.y, myShape.w, myShape.h);
     }
     sendPixelsIfNeeded();
+
 }
 
 function sendPixelsIfNeeded() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!isSocketOpen()) return;
     const now = performance.now();
-    loadPixels();
-    const current = new Uint8ClampedArray(pixels);
-    if (!lastSentPixels) {
-        queuePayload({ isFullFrame: true, pixels: current, frameSnapshot: current });
+    const minInterval = 1000 / TARGET_FPS;
+    if (now - lastFrameSentAt < minInterval) {
         return;
     }
-    const diff = extractDirtyRegion(current, lastSentPixels, width, height);
+    loadPixels();
+    const current = new Uint8ClampedArray(pixels);
+    if (!lastPixels) {
+        lastPixels = current.slice();
+        transmitPayload({ isFullFrame: true, pixels: current });
+        lastFrameSentAt = now;
+        return;
+    }
+    const diff = extractDirtyRegion(current, lastPixels, width, height);
     if (!diff) {
         return;
     }
-    diff.frameSnapshot = current;
-    queuePayload(diff);
-}
-
-function queuePayload(diff) {
-    pendingPayload = diff;
-    scheduleFlush();
-}
-
-function scheduleFlush() {
-    if (throttleTimer) return;
-    const now = performance.now();
-    const wait = Math.max(0, FRAME_INTERVAL - (now - lastFrameSentAt));
-    if (wait <= 0) {
-        flushPendingPixels();
-        return;
-    }
-    throttleTimer = setTimeout(() => {
-        throttleTimer = null;
-        flushPendingPixels();
-    }, wait);
-}
-
-function flushPendingPixels() {
-    if (!pendingPayload) {
-        return;
-    }
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        pendingPayload = null;
-        return;
-    }
-    const payload = pendingPayload;
-    pendingPayload = null;
-    transmitPayload(payload);
-    lastFrameSentAt = performance.now();
-    if (pendingPayload) {
-        scheduleFlush();
-    }
+    lastPixels = current.slice();
+    transmitPayload(diff);
+    lastFrameSentAt = now;
 }
 
 function transmitPayload(diff) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const payload = {
+    if (!isSocketOpen() || targetUUIDs.length === 0) return;
+    const serializedPixels = Array.from(diff.pixels);
+    const basePayload = {
         webviewuuid: TARGET_WEBVIEWUUID,
-        uuid: TARGET_UUID,
         senderId,
-        pixels: Array.from(diff.pixels),
+        pixels: serializedPixels,
         isFullFrame: !!diff.isFullFrame,
         fullWidth: width,
         fullHeight: height
     };
     if (diff.region) {
-        payload.region = diff.region;
+        basePayload.region = diff.region;
     }
-    ws.send(JSON.stringify(payload));
-    if (diff.frameSnapshot) {
-        lastSentPixels = diff.frameSnapshot;
-    }
+    targetUUIDs.forEach((uuid) => {
+        const payload = { ...basePayload, uuid };
+        ws.send(JSON.stringify(payload));
+    });
+}
+
+function isSocketOpen() {
+    return ws && ws.readyState === WebSocket.OPEN;
 }
 
 function extractDirtyRegion(current, previous, canvasWidth, canvasHeight) {
