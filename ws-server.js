@@ -14,6 +14,7 @@ const reusableUuidArrays = [];
 const UUID_ARRAY_POOL_LIMIT = 128;
 const webviewMetadataCache = new Map();
 const WEBVIEW_CACHE_TTL_MS = 5 * 60 * 1000;
+const lastFrameTimestamps = new Map();
 
 const wss = new WebSocket.Server({
     port: 3001,
@@ -74,7 +75,8 @@ wss.on('connection', (ws) => {
                 isFullFrame: !!data.isFullFrame,
                 fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : webviewMeta.width,
                 fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : webviewMeta.height,
-                pixelLength: typedPixels.length
+                pixelLength: typedPixels.length,
+                frameTimestamp: Date.now()
             };
 
             displayBatchCache.clear();
@@ -105,9 +107,18 @@ wss.on('connection', (ws) => {
                     releaseUuidArray(uuidsForDisplay);
                     return;
                 }
+                const deltaMap = {};
+                uuidsForDisplay.forEach((uuid) => {
+                    const computedDelta = computeDeltaMs(webviewuuid, uuid, headerBase.frameTimestamp);
+                    const senderDelta = extractSenderDelta(data, uuid);
+                    deltaMap[uuid] = typeof senderDelta === 'number' ? senderDelta : computedDelta;
+                });
+                const firstDelta = deltaMap[uuidsForDisplay[0]] ?? 0;
                 const header = {
                     ...headerBase,
-                    uuids: uuidsForDisplay
+                    uuids: uuidsForDisplay,
+                    deltas: deltaMap,
+                    deltaMs: firstDelta
                 };
                 const frameBuffer = encodeBinaryFrame(header, typedPixels);
                 displayWs.send(frameBuffer, { binary: true, compress: false });
@@ -389,4 +400,66 @@ function cleanupConnection(ws, code, reason) {
             cleanupEntry(webviewuuid, uuid);
         }
     });
+}
+
+function computeDeltaMs(webviewuuid, uuid, nowTs) {
+    const key = `${webviewuuid}:${uuid}`;
+    const previous = lastFrameTimestamps.get(key);
+    lastFrameTimestamps.set(key, nowTs);
+    if (!previous || !Number.isFinite(previous)) {
+        return 0;
+    }
+    const delta = nowTs - previous;
+    return delta >= 0 ? delta : 0;
+}
+
+function extractSenderDelta(payload, uuid) {
+    if (!payload) {
+        return null;
+    }
+    const normalizedUuid = normalizeUuidKey(uuid);
+    if (payload.deltas && typeof payload.deltas === 'object') {
+        if (normalizedUuid && Object.prototype.hasOwnProperty.call(payload.deltas, normalizedUuid)) {
+            const candidate = sanitizeDeltaMs(payload.deltas[normalizedUuid]);
+            if (candidate !== null) {
+                return candidate;
+            }
+        }
+        if (typeof uuid !== 'undefined' && Object.prototype.hasOwnProperty.call(payload.deltas, uuid)) {
+            const candidate = sanitizeDeltaMs(payload.deltas[uuid]);
+            if (candidate !== null) {
+                return candidate;
+            }
+        }
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, 'deltaMs')) {
+        const candidate = sanitizeDeltaMs(payload.deltaMs);
+        if (candidate !== null) {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+function sanitizeDeltaMs(value) {
+    if (!Number.isFinite(value)) {
+        return null;
+    }
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 5000) {
+        return 5000;
+    }
+    return value;
+}
+
+function normalizeUuidKey(value) {
+    if (typeof value === 'string' && value.length) {
+        return value;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return String(Math.trunc(value));
+    }
+    return null;
 }

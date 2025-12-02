@@ -7,12 +7,11 @@
   <script src="/p5/p5.min.js"></script>
   <script id="p5-test-script" type="text/plain" src="/p5/display-client.js"></script>
   <style>
-    body { margin: 0; padding: 0; overflow: auto; background: #fff; }
+    body { margin: 0; padding: 0; overflow: auto; background: #fff; position: relative; min-height: 100vh; }
     #canvases {
       position: absolute;
       left: 0;
       top: 0;
-      transform-origin: top left;
       margin: 0;
       padding: 0;
       font-size: 0;
@@ -20,6 +19,8 @@
       display: flex;
       flex-wrap: wrap;
       gap: 0;
+      will-change: left, top;
+      contain: layout paint;
     }
     .p5canvas-outer {
       width: 100%;
@@ -133,6 +134,31 @@
     const cols = typeof window.gridCols === 'number' ? window.gridCols : 10;
     const rows = typeof window.gridRows === 'number' ? window.gridRows : 10;
     const canvasesDiv = document.getElementById('canvases');
+    const FRAME_DROP_LAG_MS = 150;
+    const nowTime = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+    function schedulePayloadForEntry(entry, payload) {
+      if (!entry || !payload) {
+        return false;
+      }
+      const now = nowTime();
+      const delta = typeof payload.deltaMs === 'number' && Number.isFinite(payload.deltaMs)
+        ? Math.max(0, payload.deltaMs)
+        : null;
+      if (!Number.isFinite(entry.timelineTime)) {
+        entry.timelineTime = now;
+      }
+      if (delta !== null) {
+        entry.timelineTime += delta;
+      } else {
+        entry.timelineTime = now;
+      }
+      payload._scheduledTime = entry.timelineTime;
+      if (now - entry.timelineTime > FRAME_DROP_LAG_MS) {
+        entry.timelineTime = now;
+        return false;
+      }
+      return true;
+    }
 
     class PixelBufferPool {
       constructor(maxPerBucket = 32) {
@@ -270,6 +296,7 @@
         }
         if (Array.isArray(data.uuids) && data.uuids.length) {
           const totalTargets = data.uuids.length;
+          const deltas = data.deltas || null;
           data.uuids.forEach((targetUuid) => {
             const handler = this.handlers.get(targetUuid);
             if (handler) {
@@ -284,7 +311,9 @@
                 pixelBuffer: data.pixelBuffer,
                 pixelByteOffset: data.pixelByteOffset,
                 pixelByteLength: data.pixelByteLength,
-                sharedTargetCount: totalTargets
+                sharedTargetCount: totalTargets,
+                deltaMs: deltas && Object.prototype.hasOwnProperty.call(deltas, targetUuid) ? deltas[targetUuid] : data.deltaMs,
+                frameTimestamp: data.frameTimestamp
               });
             }
           });
@@ -295,6 +324,9 @@
         }
         if (typeof data.sharedTargetCount === 'undefined') {
           data.sharedTargetCount = 1;
+        }
+        if (typeof data.deltaMs === 'undefined' && data.deltas && typeof data.uuid === 'string') {
+          data.deltaMs = data.deltas[data.uuid];
         }
         const handler = this.handlers.get(data.uuid);
         if (handler) {
@@ -340,7 +372,7 @@
       constructor(bufferPool) {
         this.entries = new Map();
         this.rafId = null;
-        this.maxQueueSize = 6;
+        this.maxQueueSize = 3;
         this.bufferPool = bufferPool;
       }
 
@@ -355,7 +387,11 @@
           label: labelElement,
           outer: outerElement,
           hasLoaded: false,
-          queue: []
+          queue: [],
+          fullFrameImageData: null,
+          bitmapToken: 0,
+          timelineTime: NaN,
+          lastDisplayTime: 0
         });
       }
 
@@ -370,6 +406,9 @@
             entry.outer.dataset.loaded = 'true';
           }
         }
+        if (!schedulePayloadForEntry(entry, payload)) {
+          return;
+        }
         this.applyBackpressure(entry, payload);
         entry.queue.push(payload);
         if (!this.rafId) {
@@ -379,20 +418,20 @@
 
       flush() {
         this.rafId = null;
-        let hasRemaining = false;
         this.entries.forEach((entry) => {
           if (!entry.queue.length) {
             return;
           }
-          hasRemaining = true;
-          while (entry.queue.length) {
-            const payload = entry.queue.shift();
-            this.applyPayload(entry, payload);
+          const latestPayload = entry.queue.pop();
+          entry.queue.length = 0;
+          const now = nowTime();
+          if (latestPayload && latestPayload._scheduledTime && now - latestPayload._scheduledTime > FRAME_DROP_LAG_MS) {
+            entry.timelineTime = now;
+            return;
           }
+          this.applyPayload(entry, latestPayload);
+          entry.lastDisplayTime = now;
         });
-        if (hasRemaining) {
-          this.rafId = window.requestAnimationFrame(() => this.flush());
-        }
       }
 
       applyPayload(entry, payload) {
@@ -406,7 +445,9 @@
         }
         const typedPixels = rawPixels instanceof Uint8ClampedArray
           ? rawPixels
-          : new Uint8ClampedArray(rawPixels);
+          : (payload && payload.pixelBuffer instanceof ArrayBuffer
+            ? new Uint8ClampedArray(payload.pixelBuffer, payload.pixelByteOffset || 0, payload.pixelByteLength || rawPixels.length)
+            : new Uint8ClampedArray(rawPixels));
 
         if (payload.region && !payload.isFullFrame) {
           this.drawRegion(entry, typedPixels, payload.region);
@@ -415,14 +456,124 @@
 
         const targetWidth = entry.canvas.width;
         const targetHeight = entry.canvas.height;
-        if (typedPixels.length === targetWidth * targetHeight * 4) {
-          const imageData = this.createImageData(ctx, typedPixels, targetWidth, targetHeight);
-          ctx.putImageData(imageData, 0, 0);
-          return;
-        }
         const fullWidth = Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : targetWidth;
         const fullHeight = Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : targetHeight;
-        this.drawRegion(entry, typedPixels, { x: 0, y: 0, width: fullWidth, height: fullHeight });
+        if (payload.isFullFrame && this.isSameFullFrame(entry, payload)) {
+          return;
+        }
+        if (payload.isFullFrame) {
+          entry.lastFullFrameKey = {
+            length: typedPixels.length,
+            byteOffset: typedPixels.byteOffset || 0,
+            buffer: typedPixels.buffer
+          };
+        } else {
+          entry.lastFullFrameKey = null;
+        }
+        this.drawFullFrame(entry, typedPixels, fullWidth, fullHeight);
+      }
+
+      isSameFullFrame(entry, payload) {
+        if (!entry.lastFullFrameKey) {
+          return false;
+        }
+        const key = entry.lastFullFrameKey;
+        const buffer = payload.pixelBuffer || (payload.pixels && payload.pixels.buffer);
+        const byteOffset = payload.pixelByteOffset || (payload.pixels ? payload.pixels.byteOffset : 0) || 0;
+        const byteLength = payload.pixelByteLength || (payload.pixels ? payload.pixels.byteLength : 0) || 0;
+        if (!buffer || !byteLength) {
+          return false;
+        }
+        return key.buffer === buffer && key.byteOffset === byteOffset && key.length === byteLength;
+      }
+
+      drawFullFrame(entry, typedPixels, width, height) {
+        const ctx = entry.ctx;
+        if (!ctx) {
+          return;
+        }
+        if (this.shouldUseImageBitmap(entry, width, height)) {
+          const token = (entry.bitmapToken || 0) + 1;
+          entry.bitmapToken = token;
+          let imageData;
+          try {
+            imageData = new ImageData(typedPixels, width, height);
+          } catch (err) {
+            this.drawFullFrameViaPutImageData(entry, typedPixels, width, height);
+            return;
+          }
+          window.createImageBitmap(imageData).then((bitmap) => {
+            if (!bitmap) {
+              return;
+            }
+            if (entry.bitmapToken !== token) {
+              if (typeof bitmap.close === 'function') {
+                bitmap.close();
+              }
+              return;
+            }
+            try {
+              ctx.drawImage(bitmap, 0, 0, width, height);
+            } finally {
+              if (typeof bitmap.close === 'function') {
+                bitmap.close();
+              }
+            }
+          }).catch(() => {
+            this.drawFullFrameViaPutImageData(entry, typedPixels, width, height);
+          });
+          return;
+        }
+        this.drawFullFrameViaPutImageData(entry, typedPixels, width, height);
+      }
+
+      shouldUseImageBitmap(entry, width, height) {
+        if (typeof window.createImageBitmap !== 'function') {
+          return false;
+        }
+        const ctx = entry && entry.ctx;
+        if (!ctx || typeof ctx.drawImage !== 'function') {
+          return false;
+        }
+        const pixelCount = width * height;
+        return pixelCount >= 160000; // prefer GPU path for >= 400x400 frames
+      }
+
+      drawFullFrameViaPutImageData(entry, typedPixels, width, height) {
+        const ctx = entry.ctx;
+        if (!ctx) {
+          return;
+        }
+        const imageData = this.getReusableFullFrameImage(entry, width, height, typedPixels);
+        if (!imageData) {
+          return;
+        }
+        ctx.putImageData(imageData, 0, 0);
+      }
+
+      getReusableFullFrameImage(entry, width, height, sourcePixels) {
+        const ctx = entry.ctx;
+        if (!ctx) {
+          return null;
+        }
+        const needsNew = !entry.fullFrameImageData
+          || entry.fullFrameImageData.width !== width
+          || entry.fullFrameImageData.height !== height;
+        if (needsNew) {
+          try {
+            entry.fullFrameImageData = ctx.createImageData(width, height);
+          } catch (err) {
+            try {
+              entry.fullFrameImageData = new ImageData(width, height);
+            } catch (err2) {
+              entry.fullFrameImageData = null;
+            }
+          }
+        }
+        if (sourcePixels) {
+          entry.fullFrameImageData.data.set(sourcePixels);
+        }
+        return entry.fullFrameImageData;
       }
 
       drawRegion(entry, typedPixels, region) {
@@ -576,7 +727,8 @@
           canvasWidth: canvasElement.width,
           canvasHeight: canvasElement.height,
           fallback: false,
-          hasLoaded: false
+          hasLoaded: false,
+          timelineTime: NaN
         });
       }
 
@@ -587,6 +739,9 @@
         }
         if (entry.fallback) {
           this.fallback.enqueue(uuid, payload);
+          return;
+        }
+        if (!schedulePayloadForEntry(entry, payload)) {
           return;
         }
         if (!entry.hasLoaded) {
@@ -617,6 +772,9 @@
           canvasWidth: entry.canvasWidth,
           canvasHeight: entry.canvasHeight
         };
+        if (payload && typeof payload.deltaMs === 'number') {
+          frame.deltaMs = payload.deltaMs;
+        }
         const bufferInfo = this.extractTransferableBuffer(payload, targetCount);
         const transferables = [];
         if (bufferInfo) {
@@ -957,7 +1115,9 @@
       const viewportH = window.innerHeight;
       const offsetX = Math.max(0, (viewportW - totalWidth) / 2);
       const offsetY = Math.max(0, (viewportH - totalHeight) / 2);
-      canvasesDiv.style.transform = `translate(${offsetX}px, ${offsetY}px)`;
+      canvasesDiv.style.left = offsetX + 'px';
+      canvasesDiv.style.top = offsetY + 'px';
+      canvasesDiv.style.transform = 'none';
       const outerContainers = document.querySelectorAll('.p5canvas-outer');
       for (let i = 0; i < outerContainers.length; i++) {
         if (outerContainers[i]) {

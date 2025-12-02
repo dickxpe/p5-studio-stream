@@ -12,11 +12,12 @@ let lastPixels = null;
 let ws = null;
 let reconnectTimer = null;
 const RECONNECT_DELAY_MS = 1000;
-let targetUUIDs = [...DEFAULT_UUIDS];
+let targetUUID = DEFAULT_UUIDS[0] || '0';
 const TILE_SIZE = 8;
 const MAX_TILE_RATIO = 0.6; // Fall back to full frame if >60% pixels change
 const MAX_TILE_COUNT = 200; // Or if too many tiles would be sent
 const PIXEL_POOL_MAX_BUCKET = 24;
+const MAX_TILE_SEND_PER_FRAME = 6; // Clamp number of regional packets so the display queue doesn't drop most of them
 const textEncoder = new TextEncoder();
 
 class Uint8ClampedArrayPool {
@@ -72,16 +73,16 @@ async function refreshUUIDs() {
                 })
                 .filter((entry) => typeof entry === 'string' && entry.length > 0);
             if (parsed.length) {
-                targetUUIDs = parsed;
-                console.log("[Sender] Loaded " + targetUUIDs.length + " UUIDs from server");
+                targetUUID = parsed[0];
+                console.log("[Sender] Loaded target UUID " + targetUUID + " from server");
                 return;
             }
         }
-        console.warn("[Sender] UUID response empty, falling back to defaults");
+        console.warn("[Sender] UUID response empty, falling back to default");
     } catch (err) {
-        console.warn("[Sender] Failed to load UUIDs, using defaults", err);
+        console.warn("[Sender] Failed to load UUID, using default", err);
     }
-    targetUUIDs = [...DEFAULT_UUIDS];
+    targetUUID = DEFAULT_UUIDS[0] || '0';
 }
 
 const myShape = {
@@ -172,6 +173,7 @@ function sendPixelsIfNeeded() {
     if (now - lastFrameSentAt < minInterval) {
         return;
     }
+    const deltaMs = lastFrameSentAt > 0 ? Math.max(0, now - lastFrameSentAt) : 0;
     loadPixels();
     const pixelSource = pixels instanceof Uint8ClampedArray ? pixels : new Uint8ClampedArray(pixels);
     if (!pixelSource.length) {
@@ -181,7 +183,7 @@ function sendPixelsIfNeeded() {
     current.set(pixelSource);
 
     if (!lastPixels) {
-        transmitPayload({ isFullFrame: true, pixels: current });
+        transmitPayload({ isFullFrame: true, pixels: current }, deltaMs);
         lastPixels = current;
         lastFrameSentAt = now;
         return;
@@ -194,24 +196,27 @@ function sendPixelsIfNeeded() {
         return;
     }
 
-    transmitPayload(diff);
+    transmitPayload(diff, deltaMs);
     releaseDiffTiles(diff);
     pixelPool.release(lastPixels);
     lastPixels = current;
     lastFrameSentAt = now;
 }
 
-function transmitPayload(diff) {
-    if (!isSocketOpen() || targetUUIDs.length === 0 || !diff) return;
+function transmitPayload(diff, deltaMs) {
+    if (!isSocketOpen() || !targetUUID || !diff) return;
     if (diff.isFullFrame) {
-        sendPayloadToAll(diff.pixels, null, true);
+        sendPayloadToTarget(diff.pixels, null, true, deltaMs);
         return;
     }
     if (!Array.isArray(diff.tiles) || diff.tiles.length === 0) {
         return;
     }
+    let firstTile = true;
     diff.tiles.forEach((tile) => {
-        sendPayloadToAll(tile.pixels, tile.region, false);
+        const tileDelta = firstTile ? deltaMs : 0;
+        sendPayloadToTarget(tile.pixels, tile.region, false, tileDelta);
+        firstTile = false;
     });
 }
 
@@ -219,22 +224,33 @@ function isSocketOpen() {
     return ws && ws.readyState === WebSocket.OPEN;
 }
 
-function sendPayloadToAll(pixelsArray, region, isFullFrame) {
+function sendPayloadToTarget(pixelsArray, region, isFullFrame, deltaMs) {
+    if (!targetUUID) {
+        return;
+    }
     const typedPixels = toUint8ArrayView(pixelsArray);
     const header = {
         webviewuuid: TARGET_WEBVIEWUUID,
         senderId,
-        uuids: targetUUIDs.slice(),
+        uuid: targetUUID,
         isFullFrame,
         fullWidth: width,
         fullHeight: height,
-        pixelLength: typedPixels.byteLength
+        pixelLength: typedPixels.byteLength,
+        deltaMs: normalizeDelta(deltaMs)
     };
     if (region) {
         header.region = region;
     }
     const frame = buildBinaryFrame(header, typedPixels);
     ws.send(frame);
+}
+
+function normalizeDelta(value) {
+    if (!Number.isFinite(value) || value < 0) {
+        return 0;
+    }
+    return Math.min(2000, value);
 }
 
 function extractDirtyTiles(current, previous, canvasWidth, canvasHeight) {
@@ -273,6 +289,14 @@ function extractDirtyTiles(current, previous, canvasWidth, canvasHeight) {
         return { isFullFrame: true, pixels: current };
     }
 
+    if (changedTiles.length > MAX_TILE_SEND_PER_FRAME) {
+        const merged = mergeTilesIntoBoundingRegion(changedTiles, current, canvasWidth, canvasHeight);
+        if (merged) {
+            releaseDiffTiles({ tiles: changedTiles });
+            return { isFullFrame: false, tiles: [merged] };
+        }
+    }
+
     return { isFullFrame: false, tiles: changedTiles };
 }
 
@@ -303,6 +327,49 @@ function copyRegionPixels(sourcePixels, canvasWidth, startX, startY, regionWidth
         buffer.set(sourcePixels.subarray(srcIndex, srcIndex + rowStride), destIndex);
     }
     return buffer;
+}
+
+function mergeTilesIntoBoundingRegion(tiles, sourcePixels, canvasWidth, canvasHeight) {
+    if (!Array.isArray(tiles) || !tiles.length) {
+        return null;
+    }
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    tiles.forEach((tile) => {
+        if (!tile || !tile.region) {
+            return;
+        }
+        const { x = 0, y = 0, width = 0, height = 0 } = tile.region;
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + width);
+        maxY = Math.max(maxY, y + height);
+    });
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+        return null;
+    }
+    const mergedWidth = Math.max(1, Math.min(canvasWidth, Math.floor(maxX - minX)));
+    const mergedHeight = Math.max(1, Math.min(canvasHeight, Math.floor(maxY - minY)));
+    if (!mergedWidth || !mergedHeight) {
+        return null;
+    }
+    const originX = Math.max(0, Math.floor(minX));
+    const originY = Math.max(0, Math.floor(minY));
+    const pixels = copyRegionPixels(sourcePixels, canvasWidth, originX, originY, mergedWidth, mergedHeight);
+    return {
+        region: {
+            x: originX,
+            y: originY,
+            width: mergedWidth,
+            height: mergedHeight
+        },
+        pixels
+    };
 }
 
 function releaseDiffTiles(diff) {
