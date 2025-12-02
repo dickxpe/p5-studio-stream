@@ -134,7 +134,7 @@
     const cols = typeof window.gridCols === 'number' ? window.gridCols : 10;
     const rows = typeof window.gridRows === 'number' ? window.gridRows : 10;
     const canvasesDiv = document.getElementById('canvases');
-    const FRAME_DROP_LAG_MS = 150;
+    const FRAME_DROP_LAG_MS = 240;
     const nowTime = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
     function schedulePayloadForEntry(entry, payload) {
       if (!entry || !payload) {
@@ -152,10 +152,14 @@
       } else {
         entry.timelineTime = now;
       }
-      payload._scheduledTime = entry.timelineTime;
-      if (now - entry.timelineTime > FRAME_DROP_LAG_MS) {
+      const lateness = now - entry.timelineTime;
+      if (lateness > FRAME_DROP_LAG_MS) {
         entry.timelineTime = now;
-        return false;
+        payload._scheduledTime = now;
+        payload._late = true;
+      } else {
+        payload._scheduledTime = entry.timelineTime;
+        payload._late = false;
       }
       return true;
     }
@@ -372,7 +376,7 @@
       constructor(bufferPool) {
         this.entries = new Map();
         this.rafId = null;
-        this.maxQueueSize = 3;
+        this.maxQueueSize = 5;
         this.bufferPool = bufferPool;
       }
 
@@ -425,9 +429,13 @@
           const latestPayload = entry.queue.pop();
           entry.queue.length = 0;
           const now = nowTime();
-          if (latestPayload && latestPayload._scheduledTime && now - latestPayload._scheduledTime > FRAME_DROP_LAG_MS) {
-            entry.timelineTime = now;
-            return;
+          if (latestPayload && latestPayload._scheduledTime) {
+            const lateness = now - latestPayload._scheduledTime;
+            if (lateness > FRAME_DROP_LAG_MS) {
+              entry.timelineTime = now;
+              latestPayload._late = true;
+              latestPayload._scheduledTime = now;
+            }
           }
           this.applyPayload(entry, latestPayload);
           entry.lastDisplayTime = now;
@@ -959,12 +967,13 @@
           } else if (typeof assignedEntry === 'string') {
             assignedUUID = assignedEntry;
           }
-          const thisCounter = counter; // capture for closure
+          const displayCounter = counter + 1;
+          const thisCounter = displayCounter; // capture for closure
           if (assignedUUID) {
             const label = document.createElement('div');
             label.className = 'canvas-label';
             label.dataset.uuid = assignedUUID;
-            const indexLabel = Number.isFinite(assignedIndex) ? assignedIndex : '';
+            const indexLabel = Number.isFinite(assignedIndex) ? (assignedIndex + 1) : displayCounter;
             label.innerHTML = `<span class="canvas-label-counter">${indexLabel}</span><span class="canvas-label-ready">ready</span><span class="canvas-label-uuid">${assignedUUID}</span>`;
             const unlinkBtn = document.createElement('button');
             unlinkBtn.type = 'button';

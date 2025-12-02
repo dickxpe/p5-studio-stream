@@ -13,11 +13,13 @@ let ws = null;
 let reconnectTimer = null;
 const RECONNECT_DELAY_MS = 1000;
 let targetUUID = DEFAULT_UUIDS[0] || '0';
+let lastKeyframeSentAt = 0;
 const TILE_SIZE = 8;
 const MAX_TILE_RATIO = 0.6; // Fall back to full frame if >60% pixels change
 const MAX_TILE_COUNT = 200; // Or if too many tiles would be sent
 const PIXEL_POOL_MAX_BUCKET = 24;
 const MAX_TILE_SEND_PER_FRAME = 6; // Clamp number of regional packets so the display queue doesn't drop most of them
+const KEYFRAME_INTERVAL_MS = 3000; // Force periodic full frames to heal any missed tiles
 const textEncoder = new TextEncoder();
 
 class Uint8ClampedArrayPool {
@@ -189,11 +191,16 @@ function sendPixelsIfNeeded() {
         return;
     }
 
-    const diff = extractDirtyTiles(current, lastPixels, width, height);
+    let diff = extractDirtyTiles(current, lastPixels, width, height);
     if (!diff) {
         pixelPool.release(lastPixels);
         lastPixels = current;
         return;
+    }
+
+    const keyframeDue = now - lastKeyframeSentAt >= KEYFRAME_INTERVAL_MS;
+    if (!diff.isFullFrame && keyframeDue) {
+        diff = { isFullFrame: true, pixels: current };
     }
 
     transmitPayload(diff, deltaMs);
@@ -201,6 +208,9 @@ function sendPixelsIfNeeded() {
     pixelPool.release(lastPixels);
     lastPixels = current;
     lastFrameSentAt = now;
+    if (diff.isFullFrame) {
+        lastKeyframeSentAt = now;
+    }
 }
 
 function transmitPayload(diff, deltaMs) {

@@ -500,13 +500,13 @@ const server = http.createServer((req, res) => {
             <h1>Manage Webviews</h1>
             <div style="margin-bottom:1em; display: flex; flex-wrap: wrap; gap: 1em; align-items: center;">
               <label for="rows">Rows:</label>
-              <input id="rows" type="number" min="1" max="200" value="3" style="width:60px;">
+              <input id="rows" type="number" min="1" max="800" value="3" style="width:60px;">
               <label for="columns">Columns:</label>
-              <input id="columns" type="number" min="1" max="200" value="3" style="width:60px;">
+              <input id="columns" type="number" min="1" max="600" value="3" style="width:60px;">
               <label for="width">Width:</label>
-              <input id="width" type="number" min="5" max="5000" value="600" style="width:60px;">
+              <input id="width" type="number" min="1" max="800" value="600" style="width:60px;">
               <label for="height">Height:</label>
-              <input id="height" type="number" min="5" max="5000" value="400" style="width:60px;">
+              <input id="height" type="number" min="1" max="600" value="400" style="width:60px;">
             </div>
             <button onclick="createWebview()">Create Webview</button>
             <div id="webviews">${webviewsHtml}</div>
