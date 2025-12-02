@@ -64,9 +64,18 @@ async function refreshUUIDs() {
         }
         const data = await resp.json();
         if (Array.isArray(data) && data.length > 0) {
-            targetUUIDs = data.map((value) => String(value));
-            console.log("[Sender] Loaded " + targetUUIDs.length + " UUIDs from server");
-            return;
+            const parsed = data
+                .map((value) => {
+                    if (typeof value === 'string') return value;
+                    if (value && typeof value.uuid === 'string') return value.uuid;
+                    return '';
+                })
+                .filter((entry) => typeof entry === 'string' && entry.length > 0);
+            if (parsed.length) {
+                targetUUIDs = parsed;
+                console.log("[Sender] Loaded " + targetUUIDs.length + " UUIDs from server");
+                return;
+            }
         }
         console.warn("[Sender] UUID response empty, falling back to defaults");
     } catch (err) {

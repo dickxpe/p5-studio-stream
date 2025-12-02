@@ -689,9 +689,10 @@
     let gridCols = cols;
     let uuidMeta = [];
     let slotAssignments = [];
-    const allowedDisplayModes = new Set(['flow', 'fixed', 'random']);
+    const allowedDisplayModes = new Set(['flow', 'fixed', 'random-flow', 'random-fixed']);
     const displayModeRaw = typeof window.displayMode === 'string' ? window.displayMode.toLowerCase() : 'flow';
-    const displayMode = allowedDisplayModes.has(displayModeRaw) ? displayModeRaw : 'flow';
+    const legacyMapping = displayModeRaw === 'random' ? 'random-fixed' : displayModeRaw;
+    const displayMode = allowedDisplayModes.has(legacyMapping) ? legacyMapping : 'flow';
 
     function normalizeUuidEntry(entry) {
       if (!entry) {
@@ -733,7 +734,7 @@
         });
         return slots;
       }
-      if (displayMode === 'random') {
+      if (displayMode === 'random-fixed') {
         const slotIndices = Array.from({ length: totalSlots }, (_, i) => i);
         for (let i = slotIndices.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
@@ -746,6 +747,19 @@
           if (typeof targetSlot === 'number') {
             slots[targetSlot] = entry;
           }
+        });
+        return slots;
+      }
+      if (displayMode === 'random-flow') {
+        const shuffled = normalized.slice(0, totalSlots);
+        for (let i = shuffled.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          const temp = shuffled[i];
+          shuffled[i] = shuffled[j];
+          shuffled[j] = temp;
+        }
+        shuffled.forEach((entry, idx) => {
+          slots[idx] = entry;
         });
         return slots;
       }

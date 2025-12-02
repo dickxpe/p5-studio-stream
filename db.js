@@ -32,7 +32,8 @@ db.serialize(() => {
             console.warn('Could not backfill display_mode:', err.message);
         }
     });
-    db.run('CREATE TABLE IF NOT EXISTS uuids (id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT NOT NULL, webviewuuid TEXT, email TEXT, link_index INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
+    db.run('CREATE TABLE IF NOT EXISTS uuids (id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT, webviewuuid TEXT, email TEXT, link_index INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
+    ensureUuidColumnNullable();
     // Ensure email column exists for older databases
     db.run('ALTER TABLE uuids ADD COLUMN email TEXT', (err) => {
         if (err && !/duplicate column/i.test(err.message)) {
@@ -47,6 +48,49 @@ db.serialize(() => {
     backfillLinkIndices();
     db.run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)');
 });
+function ensureUuidColumnNullable() {
+    db.all('PRAGMA table_info(uuids)', (err, columns) => {
+        if (err || !Array.isArray(columns)) {
+            return;
+        }
+        const uuidCol = columns.find(col => col.name === 'uuid');
+        if (!uuidCol || uuidCol.notnull === 0) {
+            return;
+        }
+        db.serialize(() => {
+            db.run('ALTER TABLE uuids RENAME TO uuids__old', (renameErr) => {
+                if (renameErr) {
+                    console.warn('Could not rename uuids table during migration:', renameErr.message);
+                    return;
+                }
+                db.run('CREATE TABLE uuids (id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT, webviewuuid TEXT, email TEXT, link_index INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)', (createErr) => {
+                    if (createErr) {
+                        console.warn('Could not recreate uuids table during migration:', createErr.message);
+                        return;
+                    }
+                    db.run('INSERT INTO uuids (id, uuid, webviewuuid, email, link_index, created_at) SELECT id, uuid, webviewuuid, email, link_index, created_at FROM uuids__old', (copyErr) => {
+                        if (copyErr) {
+                            console.warn('Could not copy uuids data during migration:', copyErr.message);
+                            return;
+                        }
+                        db.run('DROP TABLE uuids__old', (dropErr) => {
+                            if (dropErr) {
+                                console.warn('Could not drop old uuids table during migration:', dropErr.message);
+                            }
+                        });
+                        db.get('SELECT MAX(id) as maxId FROM uuids', (seqErr, row) => {
+                            if (seqErr || !row) {
+                                return;
+                            }
+                            const maxId = row.maxId || 0;
+                            db.run('UPDATE sqlite_sequence SET seq = ? WHERE name = ?', [maxId, 'uuids']);
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
 function hashPassword(password) {
     return crypto.createHash('sha256').update(password).digest('hex');
 }
@@ -77,14 +121,12 @@ function saveUUID(uuid, webviewuuid, email = null) {
             // Ensure the webview exists
             db.run('INSERT OR IGNORE INTO webviews (webviewuuid) VALUES (?)', [webviewuuid], function (err) {
                 if (err) return reject(err);
-                getNextLinkIndexForDb(db, webviewuuid, (indexErr, nextIndex) => {
-                    if (indexErr) {
-                        return reject(indexErr);
+                claimSlotForDb(db, webviewuuid, uuid, email, (slotErr, slotIndex) => {
+                    if (slotErr) {
+                        reject(slotErr);
+                    } else {
+                        resolve(slotIndex);
                     }
-                    db.run('INSERT INTO uuids (uuid, webviewuuid, email, link_index) VALUES (?, ?, ?, ?)', [uuid, webviewuuid, email, nextIndex], function (err2) {
-                        if (err2) reject(err2);
-                        else resolve(this.lastID);
-                    });
                 });
             });
         } else {
@@ -93,6 +135,42 @@ function saveUUID(uuid, webviewuuid, email = null) {
                 else resolve(this.lastID);
             });
         }
+    });
+}
+
+function claimSlotForDb(targetDb, webviewuuid, uuidValue, emailValue, callback) {
+    if (!webviewuuid) {
+        callback(new Error('Missing webviewuuid'));
+        return;
+    }
+    targetDb.get('SELECT id, link_index FROM uuids WHERE webviewuuid = ? AND (uuid IS NULL OR uuid = "") ORDER BY link_index ASC LIMIT 1', [webviewuuid], (err, row) => {
+        if (err) {
+            callback(err);
+            return;
+        }
+        if (!row) {
+            getNextLinkIndexForDb(targetDb, webviewuuid, (indexErr, nextIndex) => {
+                if (indexErr) {
+                    callback(indexErr);
+                    return;
+                }
+                targetDb.run('INSERT INTO uuids (uuid, webviewuuid, email, link_index) VALUES (?, ?, ?, ?)', [uuidValue, webviewuuid, emailValue, nextIndex], function (insertErr) {
+                    if (insertErr) {
+                        callback(insertErr);
+                        return;
+                    }
+                    callback(null, nextIndex);
+                });
+            });
+            return;
+        }
+        targetDb.run('UPDATE uuids SET uuid = ?, email = ?, created_at = CURRENT_TIMESTAMP WHERE id = ?', [uuidValue, emailValue, row.id], function (updateErr) {
+            if (updateErr) {
+                callback(updateErr);
+                return;
+            }
+            callback(null, row.link_index);
+        });
     });
 }
 
@@ -132,21 +210,45 @@ function backfillLinkIndices() {
 // --- Insert default test webviewuuid and uuids on startup ---
 const TEST_WEBVIEWUUID = 'testuuid';
 const TEST_UUID_COUNT = 100;
-db.serialize(() => {
-    db.get('SELECT 1 FROM webviews WHERE webviewuuid = ?', [TEST_WEBVIEWUUID], (err, row) => {
-        if (!row) {
-            db.run('INSERT INTO webviews (webviewuuid) VALUES (?)', [TEST_WEBVIEWUUID], function (err2) {
-                if (!err2) {
-                    const stmt = db.prepare('INSERT INTO uuids (uuid, webviewuuid, email, link_index) VALUES (?, ?, ?, ?)');
-                    for (let i = 0; i < TEST_UUID_COUNT; i++) {
-                        stmt.run(i.toString(), TEST_WEBVIEWUUID, null, i + 1);
-                    }
-                    stmt.finalize();
-                    console.log('Inserted test webviewuuid and 100 uuids for test case.');
+resetTestWebview();
+
+function resetTestWebview() {
+    const rows = 10;
+    const columns = 10;
+    const width = 100;
+    const height = 100;
+    const totalSlots = TEST_UUID_COUNT;
+    db.serialize(() => {
+        db.run(`INSERT INTO webviews (webviewuuid, rows, columns, width, height)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(webviewuuid) DO UPDATE SET
+                  rows = excluded.rows,
+                  columns = excluded.columns,
+                  width = excluded.width,
+                  height = excluded.height`,
+            [TEST_WEBVIEWUUID, rows, columns, width, height], (err) => {
+                if (err) {
+                    console.warn('Failed to upsert test webview:', err.message);
                 }
             });
-        }
+        db.run('DELETE FROM uuids WHERE webviewuuid = ?', [TEST_WEBVIEWUUID], (deleteErr) => {
+            if (deleteErr) {
+                console.warn('Failed to reset test uuids:', deleteErr.message);
+                return;
+            }
+            const stmt = db.prepare('INSERT INTO uuids (uuid, webviewuuid, email, link_index) VALUES (?, ?, ?, ?)');
+            for (let i = 0; i < totalSlots; i++) {
+                stmt.run(i.toString(), TEST_WEBVIEWUUID, null, i + 1);
+            }
+            stmt.finalize((finalizeErr) => {
+                if (finalizeErr) {
+                    console.warn('Failed to finalize test uuid seeding:', finalizeErr.message);
+                } else {
+                    console.log('Reset testuuid with 100 sample uuids.');
+                }
+            });
+        });
     });
-});
+}
 
 module.exports = { saveUUID, createUser, verifyUser, getAllWebviews };
