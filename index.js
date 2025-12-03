@@ -511,18 +511,18 @@ const server = http.createServer((req, res) => {
             <button onclick="createWebview()">Create Webview</button>
             <div id="webviews">${webviewsHtml}</div>
             <script>
-              // Store credentials in sessionStorage for reuse
-              function getAuthHeader() {
-                let auth = sessionStorage.getItem('auth');
-                if (!auth) {
-                  const user = prompt('Username:', 'admin');
-                  const pass = prompt('Password:', 'admin');
-                  if (user && pass) {
-                    auth = 'Basic ' + btoa(user + ':' + pass);
-                    sessionStorage.setItem('auth', auth);
-                  }
+              function authenticatedFetch(url, options) {
+                const opts = Object.assign({ credentials: 'same-origin' }, options || {});
+                if (opts.headers) {
+                  opts.headers = Object.assign({}, opts.headers);
                 }
-                return auth;
+                return fetch(url, opts).then(response => {
+                  if (response.status === 401) {
+                    alert('Session expired. Please reload this page and sign in again.');
+                    throw new Error('Unauthorized');
+                  }
+                  return response;
+                });
               }
               function buildModeSelectHTML(webviewuuid, currentMode) {
                 var normalized = (currentMode || 'flow').toLowerCase();
@@ -539,8 +539,7 @@ const server = http.createServer((req, res) => {
                 return pad(d.getDate()) + '/' + pad(d.getMonth() + 1) + '/' + d.getFullYear() + ' - ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
               }
               function refreshWebviews() {
-                const auth = getAuthHeader();
-                fetch('/manage-webviews', { headers: { Authorization: auth } })
+                authenticatedFetch('/manage-webviews')
                   .then(r => r.json())
                   .then(webviews => {
                     const container = document.getElementById('webviews');
@@ -572,11 +571,6 @@ const server = http.createServer((req, res) => {
                   });
               }
               function updateDisplayMode(webviewuuid, mode, selectEl) {
-                const auth = getAuthHeader();
-                if (!auth) {
-                  alert('Authorization required.');
-                  return;
-                }
                 if (!webviewuuid) {
                   return;
                 }
@@ -588,22 +582,14 @@ const server = http.createServer((req, res) => {
                 if (selectEl) {
                   selectEl.disabled = true;
                 }
-                fetch('/webviews/' + encodeURIComponent(webviewuuid) + '/display-mode', {
+                authenticatedFetch('/webviews/' + encodeURIComponent(webviewuuid) + '/display-mode', {
                   method: 'POST',
                   headers: {
-                    Authorization: auth,
                     'Content-Type': 'application/json'
                   },
                   body: JSON.stringify({ displayMode: mode })
                 })
-                  .then(r => {
-                    if (r.status === 401) {
-                      sessionStorage.removeItem('auth');
-                      alert('Session expired. Please try again.');
-                      return {};
-                    }
-                    return r.json();
-                  })
+                  .then(r => r.json())
                   .then(data => {
                     if (data && data.error) {
                       alert('Update failed: ' + data.error);
@@ -621,29 +607,20 @@ const server = http.createServer((req, res) => {
                   });
               }
               function createWebview() {
-                const auth = getAuthHeader();
                 const payload = {
                   rows: parseInt(document.getElementById('rows').value, 10) || 10,
                   columns: parseInt(document.getElementById('columns').value, 10) || 10,
                   width: parseInt(document.getElementById('width').value, 10) || 100,
                   height: parseInt(document.getElementById('height').value, 10) || 100
                 };
-                fetch('/create-webview', {
+                authenticatedFetch('/create-webview', {
                   method: 'POST',
                   headers: {
-                    Authorization: auth,
                     'Content-Type': 'application/json'
                   },
                   body: JSON.stringify(payload)
                 })
-                  .then(r => {
-                    if (r.status === 401) {
-                      sessionStorage.removeItem('auth');
-                      alert('Session expired. Please try again.');
-                      return {};
-                    }
-                    return r.json();
-                  })
+                  .then(r => r.json())
                   .then(data => {
                     if(data && data.uuid) {
                       refreshWebviews();
@@ -652,27 +629,14 @@ const server = http.createServer((req, res) => {
               }
               function deleteWebview(webviewuuid, btn) {
                 if (!confirm('Delete webview ' + webviewuuid + ' and all linked uuids?')) return;
-                const auth = getAuthHeader();
-                if (!auth) {
-                  alert('Authorization required.');
-                  return;
-                }
                 if (btn) {
                   btn.disabled = true;
                   btn.classList.add('deleting');
                 }
-                fetch('/delete-webview/' + encodeURIComponent(webviewuuid), {
+                authenticatedFetch('/delete-webview/' + encodeURIComponent(webviewuuid), {
                   method: 'DELETE',
-                  headers: { Authorization: auth }
                 })
-                  .then(r => {
-                    if (r.status === 401) {
-                      sessionStorage.removeItem('auth');
-                      alert('Session expired. Please try again.');
-                      return {};
-                    }
-                    return r.json();
-                  })
+                  .then(r => r.json())
                   .then(data => {
                     if (data && data.success) {
                       refreshWebviews();
