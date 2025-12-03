@@ -123,6 +123,9 @@ function drawPayload(payload) {
     if (!ctx || !payload) {
         return;
     }
+    if (payload.encoding) {
+        return drawEncodedFrame(payload, ctx);
+    }
     const pixelArray = buildPixelArray(payload);
     if (!pixelArray || !pixelArray.length) {
         return;
@@ -271,5 +274,48 @@ function drawRegion(ctx, pixelArray, region, targetWidth, targetHeight) {
         if (borrowed) {
             pixelPool.release(payload);
         }
+    }
+}
+
+function getByteView(payload) {
+    if (!payload) {
+        return null;
+    }
+    if (payload.buffer instanceof ArrayBuffer) {
+        const byteOffset = payload.byteOffset || payload.pixelByteOffset || 0;
+        const byteLength = payload.byteLength || payload.pixelByteLength || payload.pixelLength || 0;
+        if (byteLength > 0) {
+            return new Uint8Array(payload.buffer, byteOffset, byteLength);
+        }
+    }
+    if (payload.pixels instanceof Uint8Array || payload.pixels instanceof Uint8ClampedArray) {
+        return new Uint8Array(payload.pixels.buffer, payload.pixels.byteOffset, payload.pixels.byteLength);
+    }
+    return null;
+}
+
+function drawEncodedFrame(payload, ctx) {
+    const mimeType = typeof payload.encoding === 'string' && payload.encoding.length ? payload.encoding : 'image/webp';
+    const width = Number.isFinite(payload.encodedWidth)
+        ? Math.max(1, Math.floor(payload.encodedWidth))
+        : (Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : state.width);
+    const height = Number.isFinite(payload.encodedHeight)
+        ? Math.max(1, Math.floor(payload.encodedHeight))
+        : (Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : state.height);
+    const view = getByteView(payload);
+    if (!view || !view.byteLength) {
+        return;
+    }
+    const blob = new Blob([view], { type: mimeType });
+    if (typeof createImageBitmap === 'function') {
+        return createImageBitmap(blob).then((bitmap) => {
+            try {
+                ctx.drawImage(bitmap, 0, 0, width, height);
+            } finally {
+                if (bitmap && typeof bitmap.close === 'function') {
+                    bitmap.close();
+                }
+            }
+        }).catch(() => { });
     }
 }

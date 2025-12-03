@@ -70,13 +70,18 @@ wss.on('connection', (ws) => {
                 console.log(`[${webviewuuid}] Skipping payload: metadata not found`);
                 return;
             }
+            const encodingMeta = extractEncodingMetadata(data);
             const headerBase = {
                 region,
                 isFullFrame: !!data.isFullFrame,
                 fullWidth: typeof data.fullWidth === 'number' ? data.fullWidth : webviewMeta.width,
                 fullHeight: typeof data.fullHeight === 'number' ? data.fullHeight : webviewMeta.height,
                 pixelLength: typedPixels.length,
-                frameTimestamp: Date.now()
+                frameTimestamp: Date.now(),
+                encoding: encodingMeta.encoding,
+                encodedWidth: encodingMeta.encodedWidth,
+                encodedHeight: encodingMeta.encodedHeight,
+                lossy: encodingMeta.lossy
             };
 
             displayBatchCache.clear();
@@ -400,6 +405,17 @@ function cleanupConnection(ws, code, reason) {
             cleanupEntry(webviewuuid, uuid);
         }
     });
+}
+
+function extractEncodingMetadata(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return { encoding: undefined, encodedWidth: undefined, encodedHeight: undefined, lossy: undefined };
+    }
+    const encoding = typeof payload.encoding === 'string' && payload.encoding.length ? payload.encoding : undefined;
+    const encodedWidth = Number.isFinite(payload.encodedWidth) ? payload.encodedWidth : undefined;
+    const encodedHeight = Number.isFinite(payload.encodedHeight) ? payload.encodedHeight : undefined;
+    const lossy = payload.lossy ? true : undefined;
+    return { encoding, encodedWidth, encodedHeight, lossy };
 }
 
 function computeDeltaMs(webviewuuid, uuid, nowTs) {

@@ -14,12 +14,34 @@ let reconnectTimer = null;
 const RECONNECT_DELAY_MS = 1000;
 let targetUUID = DEFAULT_UUIDS[0] || '0';
 let lastKeyframeSentAt = 0;
+let lossyCanvas = null;
+let lossyCtx = null;
+let lossyEncodingInFlight = false;
+let lossyImageData = null;
 const TILE_SIZE = 8;
 const MAX_TILE_RATIO = 0.6; // Fall back to full frame if >60% pixels change
 const MAX_TILE_COUNT = 200; // Or if too many tiles would be sent
 const PIXEL_POOL_MAX_BUCKET = 24;
 const MAX_TILE_SEND_PER_FRAME = 6; // Clamp number of regional packets so the display queue doesn't drop most of them
 const KEYFRAME_INTERVAL_MS = 3000; // Force periodic full frames to heal any missed tiles
+const LOSSY_SEND_DEFAULTS = {
+    enabled: false,
+    mimeType: 'image/webp',
+    quality: 0.7,
+    minDimension: 48
+};
+
+if (typeof window !== 'undefined') {
+    if (typeof window.enableLossySend === 'undefined') {
+        window.enableLossySend = true;
+    }
+    if (typeof window.lossySendOptions === 'undefined') {
+        window.lossySendOptions = {
+            quality: 0.6,
+            mimeType: 'image/webp'
+        };
+    }
+}
 const textEncoder = new TextEncoder();
 
 class Uint8ClampedArrayPool {
@@ -168,7 +190,7 @@ function draw() {
 
 }
 
-function sendPixelsIfNeeded() {
+async function sendPixelsIfNeeded() {
     if (!isSocketOpen()) return;
     const now = performance.now();
     const minInterval = 1000 / TARGET_FPS;
@@ -203,12 +225,35 @@ function sendPixelsIfNeeded() {
         diff = { isFullFrame: true, pixels: current };
     }
 
-    transmitPayload(diff, deltaMs);
+
+    const shouldUseLossy = shouldUseLossyEncoding(diff, width, height);
+    if (shouldUseLossy && lossyEncodingInFlight) {
+        pixelPool.release(lastPixels);
+        lastPixels = current;
+        return;
+    }
+
+    let usedLossy = false;
+    try {
+        if (shouldUseLossy) {
+            lossyEncodingInFlight = true;
+            usedLossy = await transmitLossyFullFrame(current, width, height, deltaMs);
+        } else {
+            transmitPayload(diff, deltaMs);
+        }
+    } catch (err) {
+        console.warn('[Sender] Failed to transmit frame', err);
+    } finally {
+        if (shouldUseLossy) {
+            lossyEncodingInFlight = false;
+        }
+    }
+
     releaseDiffTiles(diff);
     pixelPool.release(lastPixels);
     lastPixels = current;
     lastFrameSentAt = now;
-    if (diff.isFullFrame) {
+    if (diff.isFullFrame || usedLossy) {
         lastKeyframeSentAt = now;
     }
 }
@@ -234,7 +279,7 @@ function isSocketOpen() {
     return ws && ws.readyState === WebSocket.OPEN;
 }
 
-function sendPayloadToTarget(pixelsArray, region, isFullFrame, deltaMs) {
+function sendPayloadToTarget(pixelsArray, region, isFullFrame, deltaMs, metadataOverrides) {
     if (!targetUUID) {
         return;
     }
@@ -252,6 +297,14 @@ function sendPayloadToTarget(pixelsArray, region, isFullFrame, deltaMs) {
     if (region) {
         header.region = region;
     }
+    if (metadataOverrides && typeof metadataOverrides === 'object') {
+        Object.keys(metadataOverrides).forEach((key) => {
+            const value = metadataOverrides[key];
+            if (typeof value !== 'undefined') {
+                header[key] = value;
+            }
+        });
+    }
     const frame = buildBinaryFrame(header, typedPixels);
     ws.send(frame);
 }
@@ -261,6 +314,180 @@ function normalizeDelta(value) {
         return 0;
     }
     return Math.min(2000, value);
+}
+
+function resolveLossyOptions() {
+    const options = { ...LOSSY_SEND_DEFAULTS };
+    if (typeof window !== 'undefined') {
+        if (typeof window.enableLossySend !== 'undefined') {
+            options.enabled = Boolean(window.enableLossySend);
+        }
+        if (window.lossySendOptions && typeof window.lossySendOptions === 'object') {
+            const overrides = window.lossySendOptions;
+            if (typeof overrides.enabled !== 'undefined') {
+                options.enabled = Boolean(overrides.enabled);
+            }
+            if (typeof overrides.mimeType === 'string' && overrides.mimeType.length) {
+                options.mimeType = overrides.mimeType;
+            }
+            if (typeof overrides.quality === 'number' && Number.isFinite(overrides.quality)) {
+                options.quality = overrides.quality;
+            }
+            if (typeof overrides.minDimension === 'number' && Number.isFinite(overrides.minDimension)) {
+                options.minDimension = overrides.minDimension;
+            }
+        }
+    }
+    options.minDimension = Math.max(16, Math.floor(options.minDimension || LOSSY_SEND_DEFAULTS.minDimension || 32));
+    options.quality = Math.min(1, Math.max(0.1, options.quality));
+    return options;
+}
+
+function shouldUseLossyEncoding(diff, frameWidth, frameHeight) {
+    if (!diff || !diff.isFullFrame) {
+        return false;
+    }
+    if (!diff.pixels || !diff.pixels.length) {
+        return false;
+    }
+    const options = resolveLossyOptions();
+    if (!options.enabled) {
+        return false;
+    }
+    if (!Number.isFinite(frameWidth) || !Number.isFinite(frameHeight)) {
+        return false;
+    }
+    if (frameWidth < options.minDimension || frameHeight < options.minDimension) {
+        return false;
+    }
+    if (typeof OffscreenCanvas === 'undefined' && (typeof document === 'undefined' || typeof document.createElement !== 'function')) {
+        return false;
+    }
+    return true;
+}
+
+function ensureLossyCanvasContext(width, height) {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+        return null;
+    }
+    const targetWidth = Math.max(1, Math.floor(width));
+    const targetHeight = Math.max(1, Math.floor(height));
+    if (!lossyCanvas) {
+        if (typeof OffscreenCanvas === 'function') {
+            lossyCanvas = new OffscreenCanvas(targetWidth, targetHeight);
+        } else if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+            lossyCanvas = document.createElement('canvas');
+        }
+    }
+    if (!lossyCanvas) {
+        return null;
+    }
+    if (lossyCanvas.width !== targetWidth) {
+        lossyCanvas.width = targetWidth;
+    }
+    if (lossyCanvas.height !== targetHeight) {
+        lossyCanvas.height = targetHeight;
+    }
+    if (!lossyCtx) {
+        lossyCtx = lossyCanvas.getContext('2d');
+    }
+    if (!lossyCtx) {
+        return null;
+    }
+    if (!lossyImageData || lossyImageData.width !== targetWidth || lossyImageData.height !== targetHeight) {
+        try {
+            lossyImageData = lossyCtx.createImageData(targetWidth, targetHeight);
+        } catch (err) {
+            try {
+                lossyImageData = new ImageData(targetWidth, targetHeight);
+            } catch (err2) {
+                lossyImageData = null;
+            }
+        }
+    }
+    return lossyCtx;
+}
+
+function canvasToBlob(canvas, mimeType, quality) {
+    if (!canvas) {
+        return Promise.resolve(null);
+    }
+    if (typeof canvas.convertToBlob === 'function') {
+        return canvas.convertToBlob({ type: mimeType, quality });
+    }
+    if (typeof canvas.toBlob === 'function') {
+        return new Promise((resolve, reject) => {
+            try {
+                canvas.toBlob((blob) => resolve(blob || null), mimeType, quality);
+            } catch (err) {
+                reject(err);
+            }
+        });
+    }
+    return Promise.resolve(null);
+}
+
+async function transmitLossyFullFrame(pixelArray, width, height, deltaMs) {
+    const options = resolveLossyOptions();
+    const ctx = ensureLossyCanvasContext(width, height);
+    if (!ctx || !lossyCanvas || !pixelArray) {
+        sendPayloadToTarget(pixelArray, null, true, deltaMs);
+        return false;
+    }
+    const expectedLength = Math.max(1, Math.floor(width)) * Math.max(1, Math.floor(height)) * 4;
+    if (pixelArray.length !== expectedLength) {
+        sendPayloadToTarget(pixelArray, null, true, deltaMs);
+        return false;
+    }
+    if (!lossyImageData || lossyImageData.width !== lossyCanvas.width || lossyImageData.height !== lossyCanvas.height) {
+        try {
+            lossyImageData = ctx.createImageData(lossyCanvas.width, lossyCanvas.height);
+        } catch (err) {
+            lossyImageData = null;
+        }
+    }
+    let workingImageData = lossyImageData;
+    if (!workingImageData) {
+        try {
+            workingImageData = new ImageData(lossyCanvas.width, lossyCanvas.height);
+        } catch (err) {
+            workingImageData = null;
+        }
+    }
+    if (!workingImageData) {
+        sendPayloadToTarget(pixelArray, null, true, deltaMs);
+        return false;
+    }
+    workingImageData.data.set(pixelArray);
+    ctx.putImageData(workingImageData, 0, 0);
+    let blob;
+    try {
+        blob = await canvasToBlob(lossyCanvas, options.mimeType, options.quality);
+    } catch (err) {
+        blob = null;
+    }
+    if (!blob) {
+        sendPayloadToTarget(pixelArray, null, true, deltaMs);
+        return false;
+    }
+    let arrayBuffer;
+    try {
+        arrayBuffer = await blob.arrayBuffer();
+    } catch (err) {
+        arrayBuffer = null;
+    }
+    if (!arrayBuffer) {
+        sendPayloadToTarget(pixelArray, null, true, deltaMs);
+        return false;
+    }
+    const byteView = new Uint8Array(arrayBuffer);
+    sendPayloadToTarget(byteView, null, true, deltaMs, {
+        encoding: options.mimeType,
+        encodedWidth: width,
+        encodedHeight: height,
+        lossy: true
+    });
+    return true;
 }
 
 function extractDirtyTiles(current, previous, canvasWidth, canvasHeight) {
@@ -399,6 +626,9 @@ function toUint8ArrayView(source) {
     }
     if (source instanceof Uint8ClampedArray) {
         return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    }
+    if (source instanceof ArrayBuffer) {
+        return new Uint8Array(source);
     }
     if (Array.isArray(source)) {
         return Uint8Array.from(source);

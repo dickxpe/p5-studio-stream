@@ -317,7 +317,11 @@
                 pixelByteLength: data.pixelByteLength,
                 sharedTargetCount: totalTargets,
                 deltaMs: deltas && Object.prototype.hasOwnProperty.call(deltas, targetUuid) ? deltas[targetUuid] : data.deltaMs,
-                frameTimestamp: data.frameTimestamp
+                frameTimestamp: data.frameTimestamp,
+                encoding: data.encoding,
+                encodedWidth: data.encodedWidth,
+                encodedHeight: data.encodedHeight,
+                lossy: data.lossy
               });
             }
           });
@@ -334,7 +338,13 @@
         }
         const handler = this.handlers.get(data.uuid);
         if (handler) {
-          handler(data);
+          handler({
+            ...data,
+            encoding: data.encoding,
+            encodedWidth: data.encodedWidth,
+            encodedHeight: data.encodedHeight,
+            lossy: data.lossy
+          });
         }
       }
 
@@ -447,6 +457,10 @@
         if (!ctx) {
           return;
         }
+        if (payload && payload.encoding) {
+          this.drawEncodedFrame(entry, payload);
+          return;
+        }
         const rawPixels = payload && payload.pixels;
         if (!rawPixels) {
           return;
@@ -479,6 +493,98 @@
           entry.lastFullFrameKey = null;
         }
         this.drawFullFrame(entry, typedPixels, fullWidth, fullHeight);
+      }
+
+      drawEncodedFrame(entry, payload) {
+        const ctx = entry.ctx;
+        if (!ctx || !payload) {
+          return;
+        }
+        const targetWidth = Number.isFinite(payload.encodedWidth)
+          ? Math.max(1, Math.floor(payload.encodedWidth))
+          : (Number.isFinite(payload.fullWidth) ? Math.max(1, Math.floor(payload.fullWidth)) : entry.canvas.width);
+        const targetHeight = Number.isFinite(payload.encodedHeight)
+          ? Math.max(1, Math.floor(payload.encodedHeight))
+          : (Number.isFinite(payload.fullHeight) ? Math.max(1, Math.floor(payload.fullHeight)) : entry.canvas.height);
+        const mimeType = typeof payload.encoding === 'string' && payload.encoding.length ? payload.encoding : 'image/webp';
+        const view = this.extractPixelBufferView(payload);
+        if (!view || !view.byteLength) {
+          return;
+        }
+        const blob = new Blob([view], { type: mimeType });
+        entry.lastFullFrameKey = null;
+        const token = (entry.bitmapToken || 0) + 1;
+        entry.bitmapToken = token;
+        if (typeof window.createImageBitmap === 'function') {
+          window.createImageBitmap(blob).then((bitmap) => {
+            if (entry.bitmapToken !== token) {
+              if (bitmap && typeof bitmap.close === 'function') {
+                bitmap.close();
+              }
+              return;
+            }
+            try {
+              ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+            } finally {
+              if (bitmap && typeof bitmap.close === 'function') {
+                bitmap.close();
+              }
+            }
+          }).catch((err) => {
+            console.warn('[Display] Failed to decode encoded frame', err);
+            this.drawEncodedFrameFallback(ctx, blob, targetWidth, targetHeight);
+          });
+          return;
+        }
+        this.drawEncodedFrameFallback(ctx, blob, targetWidth, targetHeight);
+      }
+
+      drawEncodedFrameFallback(ctx, blob, width, height) {
+        if (!blob) {
+          return;
+        }
+        const urlApi = typeof window.URL !== 'undefined' ? window.URL : null;
+        if (!urlApi || typeof urlApi.createObjectURL !== 'function' || typeof urlApi.revokeObjectURL !== 'function') {
+          return;
+        }
+        if (typeof window.Image !== 'function') {
+          return;
+        }
+        const url = urlApi.createObjectURL(blob);
+        const img = new window.Image();
+        const cleanup = () => {
+          try {
+            urlApi.revokeObjectURL(url);
+          } catch (err) {}
+        };
+        img.onload = () => {
+          try {
+            ctx.drawImage(img, 0, 0, width, height);
+          } finally {
+            cleanup();
+          }
+        };
+        img.onerror = () => {
+          cleanup();
+        };
+        img.src = url;
+      }
+
+      extractPixelBufferView(payload) {
+        if (!payload) {
+          return null;
+        }
+        if (payload.pixelBuffer instanceof ArrayBuffer) {
+          const byteOffset = payload.pixelByteOffset || 0;
+          const byteLength = payload.pixelByteLength || payload.pixelLength || 0;
+          if (byteLength > 0) {
+            return new Uint8Array(payload.pixelBuffer, byteOffset, byteLength);
+          }
+        }
+        if (payload.pixels instanceof Uint8Array || payload.pixels instanceof Uint8ClampedArray) {
+          return new Uint8Array(payload.pixels.buffer, payload.pixels.byteOffset, payload.pixels.byteLength);
+        }
+        return null;
       }
 
       isSameFullFrame(entry, payload) {
@@ -778,7 +884,11 @@
           fullHeight: payload && Number.isFinite(payload.fullHeight) ? payload.fullHeight : entry.canvasHeight,
           pixelLength: payload && payload.pixelLength ? payload.pixelLength : 0,
           canvasWidth: entry.canvasWidth,
-          canvasHeight: entry.canvasHeight
+          canvasHeight: entry.canvasHeight,
+          encoding: payload && payload.encoding ? payload.encoding : null,
+          encodedWidth: payload && Number.isFinite(payload.encodedWidth) ? payload.encodedWidth : null,
+          encodedHeight: payload && Number.isFinite(payload.encodedHeight) ? payload.encodedHeight : null,
+          lossy: payload && payload.lossy ? true : false
         };
         if (payload && typeof payload.deltaMs === 'number') {
           frame.deltaMs = payload.deltaMs;
@@ -840,7 +950,17 @@
     }
 
     const supportsOffscreenWorkers = typeof window.OffscreenCanvas === 'function' && typeof window.Worker === 'function';
-    const canvasRenderer = supportsOffscreenWorkers
+    const canTransferToOffscreen = typeof window.HTMLCanvasElement !== 'undefined'
+      && typeof window.HTMLCanvasElement.prototype.transferControlToOffscreen === 'function';
+    const forceWorkerRendering = window.forceWorkerRendering === true;
+    const disableWorkerRendering = window.disableWorkerRendering === true;
+    const shouldUseWorkerRenderer = !disableWorkerRendering && (forceWorkerRendering || (supportsOffscreenWorkers && canTransferToOffscreen));
+    if (shouldUseWorkerRenderer) {
+      console.log('[Display] Using OffscreenCanvas worker renderer');
+    } else {
+      console.log('[Display] Using main-thread canvas renderer');
+    }
+    const canvasRenderer = shouldUseWorkerRenderer
       ? new OffscreenCanvasManager('/p5/display-worker.js', displayPixelPool)
       : new CanvasRenderManager(displayPixelPool);
     const sharedDisplaySocket = window._sharedDisplaySocket || new SharedDisplaySocket(window.uuid);

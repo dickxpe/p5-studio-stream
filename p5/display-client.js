@@ -103,6 +103,10 @@ this.testSetup = function () {
 
     sk.applyPixelPayload = function (payload) {
         const rawPixels = payload && payload.pixels;
+        if (payload && payload.encoding) {
+            drawEncodedPayload(payload);
+            return;
+        }
         if (!payload || (!Array.isArray(rawPixels) && !(rawPixels instanceof Uint8Array) && !(rawPixels instanceof Uint8ClampedArray))) {
             return;
         }
@@ -146,6 +150,64 @@ this.testSetup = function () {
         sk.updatePixels();
     };
 
+    function drawEncodedPayload(payload) {
+        const ctx = sk.drawingContext;
+        if (!ctx) {
+            return;
+        }
+        const buffer = payload.pixelBuffer instanceof ArrayBuffer ? payload.pixelBuffer : (payload.pixels && payload.pixels.buffer);
+        const byteOffset = payload.pixelByteOffset || (payload.pixels ? payload.pixels.byteOffset : 0) || 0;
+        const byteLength = payload.pixelByteLength || (payload.pixels ? payload.pixels.byteLength : 0) || 0;
+        if (!buffer || !byteLength) {
+            return;
+        }
+        const view = new Uint8Array(buffer, byteOffset, byteLength);
+        const blob = new Blob([view], { type: payload.encoding || 'image/webp' });
+        const targetWidth = Number.isFinite(payload.encodedWidth) ? Math.max(1, Math.floor(payload.encodedWidth)) : sk.width;
+        const targetHeight = Number.isFinite(payload.encodedHeight) ? Math.max(1, Math.floor(payload.encodedHeight)) : sk.height;
+        if (typeof window.createImageBitmap === 'function') {
+            window.createImageBitmap(blob).then((bitmap) => {
+                try {
+                    ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+                } finally {
+                    if (bitmap && typeof bitmap.close === 'function') {
+                        bitmap.close();
+                    }
+                }
+            }).catch(() => {
+                drawEncodedPayloadFallback(ctx, blob, targetWidth, targetHeight);
+            });
+            return;
+        }
+        drawEncodedPayloadFallback(ctx, blob, targetWidth, targetHeight);
+    }
+
+    function drawEncodedPayloadFallback(ctx, blob, width, height) {
+        const urlApi = typeof window.URL !== 'undefined' ? window.URL : null;
+        if (!urlApi || typeof urlApi.createObjectURL !== 'function' || typeof urlApi.revokeObjectURL !== 'function') {
+            return;
+        }
+        if (typeof window.Image !== 'function') {
+            return;
+        }
+        const url = urlApi.createObjectURL(blob);
+        const img = new window.Image();
+        const cleanup = () => {
+            try {
+                urlApi.revokeObjectURL(url);
+            } catch (err) { }
+        };
+        img.onload = () => {
+            try {
+                ctx.drawImage(img, 0, 0, width, height);
+            } finally {
+                cleanup();
+            }
+        };
+        img.onerror = cleanup;
+        img.src = url;
+    }
+
     function decodeBinaryFrame(buffer, decoder) {
         if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 4) {
             return null;
@@ -171,6 +233,10 @@ this.testSetup = function () {
         }
         const pixelBytesLength = buffer.byteLength - totalHeaderBytes;
         metadata.pixels = new Uint8ClampedArray(buffer, totalHeaderBytes, pixelBytesLength);
+        metadata.pixelBuffer = buffer;
+        metadata.pixelByteOffset = totalHeaderBytes;
+        metadata.pixelByteLength = pixelBytesLength;
+        metadata.pixelLength = pixelBytesLength;
         return metadata;
     }
 };
