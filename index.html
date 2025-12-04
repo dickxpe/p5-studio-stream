@@ -136,6 +136,39 @@
     const canvasesDiv = document.getElementById('canvases');
     const FRAME_DROP_LAG_MS = 240;
     const nowTime = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+
+    function computeWebSocketUrl() {
+      if (typeof window === 'undefined') {
+        return 'ws://localhost:3001';
+      }
+      if (typeof window.WS_URL === 'string' && window.WS_URL.length) {
+        return window.WS_URL;
+      }
+      const isHttps = window.location && window.location.protocol === 'https:';
+      const protocol = isHttps ? 'wss:' : 'ws:';
+      let hostname = (typeof window.WS_HOST === 'string' && window.WS_HOST.length)
+        ? window.WS_HOST
+        : (window.location && window.location.hostname) || 'localhost';
+      let port;
+      if (typeof window.WS_PORT !== 'undefined' && window.WS_PORT !== null && window.WS_PORT !== '') {
+        port = String(window.WS_PORT);
+      } else if (window.location && window.location.port) {
+        port = window.location.port;
+      } else if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        port = '3001';
+      } else {
+        port = '';
+      }
+      let path = typeof window.WS_PATH === 'string' ? window.WS_PATH.trim() : '';
+      if (path === '/') {
+        path = '';
+      } else if (path && !path.startsWith('/')) {
+        path = `/${path}`;
+      }
+      const portSegment = port ? `:${port}` : '';
+      return `${protocol}//${hostname}${portSegment}${path}`;
+    }
+    window.resolveWebSocketUrl = window.resolveWebSocketUrl || computeWebSocketUrl;
     function schedulePayloadForEntry(entry, payload) {
       if (!entry || !payload) {
         return false;
@@ -216,7 +249,10 @@
 
       connect() {
         try {
-          this.ws = new window.WebSocket('ws://localhost:3001');
+          const targetUrl = typeof window.resolveWebSocketUrl === 'function'
+            ? window.resolveWebSocketUrl()
+            : computeWebSocketUrl();
+          this.ws = new window.WebSocket(targetUrl);
           this.ws.binaryType = 'arraybuffer';
         } catch (err) {
           console.error('[DisplaySocket] Failed to create WebSocket', err);

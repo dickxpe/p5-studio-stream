@@ -18,7 +18,20 @@ this.testSetup = function () {
     sk.frameProcessing = false;
     sk.decoder = typeof window.TextDecoder === 'function' ? new window.TextDecoder() : null;
 
-    sk.ws = new window.WebSocket('ws://localhost:3001');
+    const fallbackResolveWebSocketUrl = () => {
+        const isHttps = window.location && window.location.protocol === 'https:';
+        const protocol = isHttps ? 'wss:' : 'ws:';
+        const hostname = (window.location && window.location.hostname) || 'localhost';
+        let port = window.location && window.location.port;
+        if (!port && (hostname === 'localhost' || hostname === '127.0.0.1')) {
+            port = '3001';
+        }
+        const portSegment = port ? `:${port}` : '';
+        return `${protocol}//${hostname}${portSegment}`;
+    };
+    const wsResolver = (typeof window.resolveWebSocketUrl === 'function') ? window.resolveWebSocketUrl : fallbackResolveWebSocketUrl;
+    const wsTarget = wsResolver();
+    sk.ws = new window.WebSocket(wsTarget);
     sk.ws.binaryType = 'arraybuffer';
     sk.ws.onopen = () => {
         sk.statusDiv.html('WebSocket: connected');

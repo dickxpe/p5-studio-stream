@@ -3,7 +3,43 @@
  * Replace TARGET_WEBVIEWUUID with your own value.
  */
 const DEFAULT_UUIDS = Array.from({ length: 100 }, (_, i) => String(i));
-const WS_ADDRESS = 'ws://localhost:3001';
+const WS_ADDRESS = (() => {
+    if (typeof process !== 'undefined' && process.env && process.env.WS_ADDRESS) {
+        return process.env.WS_ADDRESS;
+    }
+    if (typeof window !== 'undefined') {
+        if (typeof window.resolveWebSocketUrl === 'function') {
+            return window.resolveWebSocketUrl();
+        }
+        if (typeof window.WS_URL === 'string' && window.WS_URL.length) {
+            return window.WS_URL;
+        }
+        const isHttps = window.location && window.location.protocol === 'https:';
+        const protocol = isHttps ? 'wss:' : 'ws:';
+        let hostname = (typeof window.WS_HOST === 'string' && window.WS_HOST.length)
+            ? window.WS_HOST
+            : (window.location && window.location.hostname) || 'localhost';
+        let port;
+        if (typeof window.WS_PORT !== 'undefined' && window.WS_PORT !== null && window.WS_PORT !== '') {
+            port = String(window.WS_PORT);
+        } else if (window.location && window.location.port) {
+            port = window.location.port;
+        } else if (hostname === 'localhost' || hostname === '127.0.0.1') {
+            port = '3001';
+        } else {
+            port = '';
+        }
+        let path = typeof window.WS_PATH === 'string' ? window.WS_PATH.trim() : '';
+        if (path === '/') {
+            path = '';
+        } else if (path && !path.startsWith('/')) {
+            path = `/${path}`;
+        }
+        const portSegment = port ? `:${port}` : '';
+        return `${protocol}//${hostname}${portSegment}${path}`;
+    }
+    return 'ws://localhost:3001';
+})();
 const TARGET_WEBVIEWUUID = 'testuuid';
 const TARGET_FPS = 30;
 const senderId = Math.random().toString(36).slice(2);
