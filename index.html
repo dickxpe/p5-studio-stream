@@ -123,6 +123,12 @@
   </style>
 </head>
 <body>
+  <script>
+    window.WS_HOST = window.WS_HOST || (window.location && window.location.hostname) || 'localhost';
+    if (typeof window.WS_PORT === 'undefined' || window.WS_PORT === null || window.WS_PORT === '') {
+      window.WS_PORT = 3001;
+    }
+  </script>
   <div id="canvases"></div>
   <script>
     const canvasWidthPx = typeof window.gridWidth === 'number' ? window.gridWidth : 100;
